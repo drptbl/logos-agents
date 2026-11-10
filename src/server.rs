@@ -2,7 +2,7 @@
 //! [`jobs`]. It wraps a [`LogosServer`] and passes on every call it has no
 //! tool for, so the node tools behave exactly as they do in logos-mcp.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -21,8 +21,8 @@ use logos_mcp::{
     guard,
     logosctl::{Arg, LogosError},
     server::{
-        ChatSendParams, ChatStartParams, LogosServer, MAX_CHAT_BYTES, SendError, ServiceParams,
-        TransferParams, sanitise_peer_text, service_entry,
+        ChatSendParams, ChatStartParams, JOB_ACCOUNTS, LogosServer, MAX_CHAT_BYTES, SendError,
+        ServiceParams, TransferParams, sanitise_peer_text, service_entry,
     },
 };
 

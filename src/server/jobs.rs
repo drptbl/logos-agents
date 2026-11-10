@@ -17,8 +17,6 @@ const QUOTE_VALID_MS: u64 = 30 * 60 * 1000;
 const DELIVER_WITHIN_S: u64 = 10 * 60;
 /// Room kept in a chat message for the protocol fields around a text input or output.
 const ENVELOPE_BYTES: usize = 1024;
-/// Next to the wallet: which accounts were created to be paid for a job.
-const JOB_ACCOUNTS: &str = "job-accounts.json";
 /// Kept between an escrow deadline and the calls that race it: the chain
 /// checks block timestamps, seen 138 s behind, and a refused call costs its
 /// whole fee.
@@ -806,11 +804,6 @@ impl AgentServer {
         Ok(())
     }
 
-    /// A file kept next to the agent wallet's own.
-    fn job_accounts_file(&self) -> Option<PathBuf> {
-        self.base.wallet_side_file(JOB_ACCOUNTS)
-    }
-
     /// The service state, with the payments a previous run left loaded.
     async fn with_payments(&self) -> tokio::sync::MutexGuard<'_, Services> {
         let mut state = self.services.lock().await;
@@ -865,17 +858,14 @@ impl AgentServer {
         saved
     }
 
-    /// Which accounts were made for which job: account id -> `{job, service}`.
-    /// Refused when the file is there but can't be read.
-    pub(super) fn job_accounts(&self) -> Result<BTreeMap<String, Value>, String> {
-        guard::read_side_map(self.job_accounts_file())
-            .map_err(|e| format!("{JOB_ACCOUNTS} next to the wallet can't be read ({e})"))
-    }
-
-    /// Never writes over a file it couldn't read.
+    /// Note the account made for a job in logos-mcp's job-accounts file, so
+    /// `wallet_accounts` marks it. Never writes over a file it couldn't read.
     fn record_job_account(&self, account_id: &str, job: &str, service: &str) -> Result<(), String> {
-        let file = self.job_accounts_file().ok_or("no wallet configured")?;
-        let mut accounts = self.job_accounts()?;
+        let file = self
+            .base
+            .wallet_side_file(JOB_ACCOUNTS)
+            .ok_or("no wallet configured")?;
+        let mut accounts = self.base.job_accounts()?;
         accounts.insert(
             account_id.to_string(),
             json!({ "job": job, "service": service }),

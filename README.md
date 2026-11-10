@@ -32,6 +32,8 @@ A job, step by step:
 
 Escrow steps take a few minutes to land on the testnet. `service_jobs` always says what to call next.
 
+The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
+
 ## Requirements
 
 Everything [logos-mcp needs](https://github.com/drptbl/logos-mcp#requirements), plus:
@@ -42,7 +44,27 @@ Everything [logos-mcp needs](https://github.com/drptbl/logos-mcp#requirements), 
 
 Every escrow call needs the network's fee reserve, the wallet's `gas_limit` times the base fee. A `gas_limit` of about 200,000 in the wallet config keeps that near 1.7M lepta. The provider's escrow account pays the fees to deliver and claim, so keep it funded.
 
-## Build
+## Install
+
+Download the binary for your platform from the [latest release](https://github.com/drptbl/logos-agents/releases/latest):
+
+1. macOS, Apple Silicon => `aarch64-apple-darwin`
+2. Linux x86_64 => `x86_64-unknown-linux-gnu`
+3. Linux arm64 => `aarch64-unknown-linux-gnu`
+
+Check it against its `.sha256` before you run it. On macOS:
+
+```bash
+v=v0.1.0 target=aarch64-apple-darwin
+curl -LO https://github.com/drptbl/logos-agents/releases/download/$v/logos-agents-$v-$target.tar.gz
+curl -LO https://github.com/drptbl/logos-agents/releases/download/$v/logos-agents-$v-$target.tar.gz.sha256
+shasum -a 256 -c logos-agents-$v-$target.tar.gz.sha256
+tar xzf logos-agents-$v-$target.tar.gz
+```
+
+On Linux, use `sha256sum -c` instead of `shasum -a 256 -c`. The binary is `logos-agents-$v-$target/logos-agents`. It takes the same options and environment as logos-mcp.
+
+To build it yourself instead:
 
 ```bash
 git clone https://github.com/drptbl/logos-agents
@@ -50,7 +72,17 @@ cd logos-agents
 cargo build --release
 ```
 
-The binary is `target/release/logos-agents`. It takes the same options and environment as logos-mcp.
+The binary is then `target/release/logos-agents`.
+
+## Run it inside Basecamp
+
+The module uses Basecamp's own messaging node, storage and wallet. Add this repository to Basecamp: in Package Repositories, paste
+
+```text
+https://raw.githubusercontent.com/drptbl/logos-agents/main/logos-repo.json
+```
+
+and install `logos_agents` and the Agent Services app from the catalog. Both are signed, and `logos-repo.json` lists the signer's DID as trusted. The module serves MCP on `http://127.0.0.1:8766/mcp`, so it can run next to logos-mcp's on 8765. The Agent Services app shows how to connect a client.
 
 ## Add it to your MCP client
 
