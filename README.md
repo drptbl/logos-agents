@@ -26,11 +26,11 @@ Services follow the [agent services protocol](docs/services-protocol.md). Quotes
 A job, step by step:
 
 1. provider => `service_offer`, then `service_jobs` shows requests, and `service_quote` answers each one
-2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, call `service_pay` again once the open lands, so the provider is told
-3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, call it again with the same output once the delivery lands, then `service_claim`
-4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, `service_refund` takes the money back
+2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, the server tells the provider once the open lands
+3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, the server sends the result once the delivery lands, then claims the price
+4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, the server takes the money back
 
-Escrow steps take a few minutes to land on the testnet. `service_jobs` always says what to call next.
+Escrow steps take a few minutes to land on the testnet. While it runs, the server checks every job about once a minute and takes the steps that only wait on the chain: telling the provider, sending a recorded result, claiming and refunding. It never pays, quotes, delivers new work or declines. Over stdio it runs while your client is connected, and in Basecamp while the module is loaded. Each step is still a tool call, and `service_jobs` always says what to call next, so your agent can do it sooner.
 
 The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
 
