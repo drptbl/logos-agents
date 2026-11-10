@@ -3749,3 +3749,98 @@ async fn the_follow_through_leaves_a_job_id_used_twice() {
     assert!(s.follow_through().await.is_empty());
     assert!(fake.calls_to("chat_module.send_message").is_empty());
 }
+
+#[tokio::test]
+async fn an_open_landing_while_it_is_checked_is_not_taken_as_refused() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+
+    // Not open when read, included when polled right after: it landed in between.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "true"),
+    );
+    let s = services_server_in(fake.clone(), dir.path());
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(s.follow_through().await, [format!("service_pay {JOB}")]);
+    assert_eq!(
+        sent(&fake.calls_to("chat_module.send_message")[0]).body,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_finished_job_drops_out_of_the_follow_through_with_its_kept_result() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    let (s, dir) = services_server(fake.clone());
+    s.service_deliver(deliver_done()).await.unwrap();
+    let kept = || std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
+    assert!(kept().contains(JOB));
+
+    // The provider returned it after all: the kept result goes, and the
+    // escrow is no longer read.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 5),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert!(!kept().contains(JOB));
+    let reads = fake.calls_to("lez_core.get_account_public").len();
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(fake.calls_to("lez_core.get_account_public").len(), reads);
+}
+
+#[tokio::test]
+async fn a_job_with_nothing_due_costs_one_escrow_read() {
+    let fake = node();
+    fake.set("chat_module.get_messages", buyer_paid_history(FAR, &[]));
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR, 0),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(fake.calls_to("chat_module.list_conversations").len(), 1);
+    assert_eq!(fake.calls_to("lez_core.get_account_public").len(), 1);
+}
