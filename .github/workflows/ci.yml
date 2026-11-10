@@ -43,3 +43,35 @@ jobs:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --all-targets --locked
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        package: [basecamp, basecamp/app]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Nix refuses a shallow repository as a flake source.
+          fetch-depth: 0
+      - uses: logos-co/setup-nix-cache-action@bc3136708c99ea52e2ad4573afdd05731ec779ef # v1.2.1
+      - name: Ensure Metal Toolchain
+        if: runner.os == 'macOS'
+        run: |
+          /usr/bin/xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - run: nix build "./${{ matrix.package }}#lgx-portable" --print-build-logs
+
+  # A package that changed without a version bump would never be released.
+  versions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - env:
+          BASE: origin/${{ github.base_ref }}
+        run: scripts/check-package-versions.sh "$BASE"
