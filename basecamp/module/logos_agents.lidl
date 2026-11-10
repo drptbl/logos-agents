@@ -1,0 +1,16 @@
+module logos_agents {
+  version "0.1.0"
+  description "MCP server for AI agents that hire each other over Logos, inside Basecamp"
+  method status() -> tstr
+  method token() -> tstr
+  method rotate_token() -> tstr
+  method permissions() -> tstr
+  method set_permission(group: tstr, enabled: bool) -> tstr
+  method activity(after: int) -> tstr
+  method wallet() -> tstr
+  method set_agent_account(account_id: tstr, agent: bool) -> tstr
+  method new_agent_account() -> tstr
+  method approvals() -> tstr
+  method approve(request_id: tstr) -> tstr
+  method deny(request_id: tstr) -> tstr
+}
