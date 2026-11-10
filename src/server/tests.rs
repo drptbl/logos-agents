@@ -3155,3 +3155,23 @@ async fn connected(s: AgentServer) -> rmcp::service::RunningService<rmcp::RoleCl
     });
     ().serve(client_io).await.unwrap()
 }
+
+#[tokio::test]
+async fn every_tool_is_listed_once() {
+    // logos-mcp's own tools and this server's, with no name twice.
+    let (s, _dir) = services_server(node());
+    let client = connected(s).await;
+    let mut names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let all = names.len();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), all, "{names:?}");
+    assert!(names.iter().any(|n| n == "service_jobs"), "{names:?}");
+    assert!(names.iter().any(|n| n == "wallet_transfer"), "{names:?}");
+}

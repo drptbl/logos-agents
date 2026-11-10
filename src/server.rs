@@ -113,6 +113,10 @@ impl ServerHandler for AgentServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         let mut listed = self.base.list_tools(request, context).await?;
+        // A tool this server has replaces logos-mcp's of the same name.
+        listed
+            .tools
+            .retain(|t| !self.tool_router.has_route(&t.name));
         listed.tools.extend(
             self.tool_router
                 .list_all()
