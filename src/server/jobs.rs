@@ -1881,6 +1881,16 @@ impl AgentServer {
                             "the escrow open {tx} hasn't landed yet: call service_pay again in a few minutes"
                         ));
                     }
+                    // It may have landed after the escrow was read above.
+                    match self.escrow_record(e).await {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            return Err(format!(
+                                "the escrow open {tx} has just landed: call service_pay again to tell the provider"
+                            ));
+                        }
+                        Err(err) => return Err(format!("can't read the job's escrow: {err}")),
+                    }
                     self.note_payment(&job.job, None).await;
                     return Err(format!(
                         "the escrow open {tx} was refused on chain, so nothing is locked: check {} holds the price and the network fee, then call service_pay again",
