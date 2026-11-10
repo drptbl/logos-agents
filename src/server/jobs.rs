@@ -922,6 +922,11 @@ impl AgentServer {
         let Ok(jobs) = self.all_jobs().await else {
             return done;
         };
+        // A job id in two conversations is left alone, as the tools leave it.
+        let mut seen = BTreeMap::<String, usize>::new();
+        for f in &jobs {
+            *seen.entry(f.job.job.clone()).or_default() += 1;
+        }
         let notes = self.with_payments().await.submitted.clone();
         let pending = self.services.lock().await.pending.clone();
         for Found {
@@ -931,6 +936,9 @@ impl AgentServer {
         } in jobs
         {
             let id = job.job.clone();
+            if seen[&id] > 1 {
+                continue;
+            }
             let step = match (job.role, job.state) {
                 // A payment under way: tell the provider once it has landed.
                 (Role::Buyer, State::Quoted)
