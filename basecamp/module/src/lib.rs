@@ -159,6 +159,7 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
     ));
     let for_wallet = server.clone();
     let agents = AgentServer::new(server);
+    let following = agents.clone();
     let app = router(move || Ok(agents.clone()), control.tokens());
 
     let stop = STOP
@@ -187,6 +188,9 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
                     }
                 };
                 let _ = tx.send(Ok(()));
+                // Jobs are followed through while the module runs, with or
+                // without a client connected.
+                following.start_follow_through();
                 let served = axum::serve(listener, app)
                     .with_graceful_shutdown(stop.clone().cancelled_owned())
                     .await;

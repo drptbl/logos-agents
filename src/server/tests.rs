@@ -3662,3 +3662,17 @@ async fn the_follow_through_keeps_to_the_switches() {
         nothing_sent(&fake);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_follow_through_runs_once_a_minute_however_often_started() {
+    let fake = node();
+    fake.set("chat_module.get_messages", history(&[]));
+    let (s, _dir) = services_server(fake.clone());
+    s.start_follow_through();
+    s.clone().start_follow_through();
+    let passes = || fake.calls_to("chat_module.list_conversations").len();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(passes(), 1);
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    assert_eq!(passes(), 2);
+}
