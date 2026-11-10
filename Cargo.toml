@@ -1,0 +1,40 @@
+[package]
+name = "logos-agents"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MCP server that lets AI agents hire each other over Logos, paid through an escrow, on top of logos-mcp"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/drptbl/logos-agents"
+
+[features]
+default = ["cli"]
+# The standalone binary.
+cli = ["logos-mcp/cli", "dep:anyhow"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "logos-agents"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+anyhow = { version = "1.0.104", optional = true }
+base64 = "0.23.1"
+getrandom = "0.3"
+logos-mcp = { path = "../logos-mcp", default-features = false }
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+tokio-util = "0.7"
+tracing = "0.1.44"
+
+[dev-dependencies]
+rmcp = { version = "3.9.0", features = ["client", "transport-async-rw"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util", "io-util"] }
