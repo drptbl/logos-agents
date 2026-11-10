@@ -32,6 +32,8 @@ A job, step by step:
 
 Escrow steps take a few minutes to land on the testnet. `service_jobs` always says what to call next.
 
+The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
+
 ## Requirements
 
 Everything [logos-mcp needs](https://github.com/drptbl/logos-mcp#requirements), plus:
