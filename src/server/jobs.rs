@@ -73,6 +73,10 @@ struct InFlight {
     /// `None` when the send had no clear outcome.
     tx: Option<String>,
     sent_ms: u64,
+    /// The escrow's state when the call was sent: once it has moved on, the
+    /// call landed. `None` in entries saved before this was kept.
+    #[serde(default)]
+    from: Option<JobState>,
 }
 
 /// Why nothing is paid or cancelled while `PAYMENTS` can't be read.
@@ -657,7 +661,13 @@ impl AgentServer {
             }
             state.in_flight.get(job).cloned()
         };
+        // The escrow moved on from where the earlier call left it: that call
+        // landed, and `seen` is read after it, so there's nothing to wait for.
+        let moved_on = earlier
+            .as_ref()
+            .is_some_and(|f| f.from.is_some_and(|from| from != seen));
         if let Some(f) = earlier
+            && !moved_on
             && now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS
         {
             let Some(tx) = f.tx else {
@@ -702,6 +712,7 @@ impl AgentServer {
             Some(InFlight {
                 tx,
                 sent_ms: now_ms(),
+                from: Some(seen),
             }),
         )
         .await;

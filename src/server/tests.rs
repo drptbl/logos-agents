@@ -3175,3 +3175,37 @@ async fn every_tool_is_listed_once() {
     assert!(names.iter().any(|n| n == "service_jobs"), "{names:?}");
     assert!(names.iter().any(|n| n == "wallet_transfer"), "{names:?}");
 }
+
+#[tokio::test]
+async fn a_call_the_escrow_has_moved_past_needs_no_poll() {
+    // The delivery landed (the escrow moved from open to delivered), so the
+    // claim goes at once: no status poll, which can block for minutes.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-in-flight.json"),
+        json!({ JOB: { "tx": "deliver1", "sent_ms": now_ms(), "from": "open" } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("lez_core.poll_transaction_status").is_empty());
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
