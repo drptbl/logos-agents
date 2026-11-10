@@ -1551,6 +1551,15 @@ impl AgentServer {
                         result: hash,
                         deadline: e.deadline,
                     };
+                    // Kept before it is recorded: a delivery with no clear
+                    // answer may still land, and then this output goes out.
+                    self.save_result(&job.job, Some(&kept))
+                        .await
+                        .map_err(|err| {
+                            format!(
+                                "the output couldn't be kept, so the delivery isn't recorded: {err}"
+                            )
+                        })?;
                     let tx = self
                         .escrow_send_once(
                             e,
@@ -1562,14 +1571,10 @@ impl AgentServer {
                         )
                         .await
                         .map_err(|err| format!("the delivery wasn't recorded in escrow: {err}"))?;
-                    let note = match self.save_result(&job.job, Some(&kept)).await {
-                        Ok(()) => "recorded: once it lands, this server sends the result and then claims the payment on its own while it runs. To do it sooner, call service_deliver again with the same output once service_jobs shows the escrow delivered, then service_claim".to_string(),
-                        Err(e) => format!("recorded, but the output couldn't be kept ({e}): once service_jobs shows the escrow delivered, call service_deliver again with the same output, then service_claim"),
-                    };
                     return Ok(json!({
                         "job": job.job,
                         "escrow_deliver_tx": tx,
-                        "note": note,
+                        "note": "recorded: once it lands, this server sends the result and then claims the payment on its own while it runs. To do it sooner, call service_deliver again with the same output once service_jobs shows the escrow delivered, then service_claim",
                     }));
                 }
                 JobState::Delivered | JobState::Claimed | JobState::Released => {
