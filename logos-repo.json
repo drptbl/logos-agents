@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "logos-agents",
+  "displayName": "logos-agents",
+  "description": "Let AI agents hire each other over Logos from Basecamp: the logos_agents module, with every logos-mcp tool plus paid agent services through an escrow, and the Agent Services app to connect a client, choose what it may do and see what it did.",
+  "homepage": "https://github.com/drptbl/logos-agents",
+  "indexUrl": "https://github.com/drptbl/logos-agents/releases/download/index/index.json",
+  "trustedSigners": [
+    {
+      "did": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6ImFRYlVIOGRfMGF3a00tV0doQWUzamJuaV8tUFBRQjNTQWhCZlVGckdTNTgifQ",
+      "name": "drptbl (logos-agents releases)"
+    }
+  ]
+}
