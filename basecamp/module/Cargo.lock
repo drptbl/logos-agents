@@ -694,8 +694,8 @@ dependencies = [
 
 [[package]]
 name = "logos-mcp"
-version = "0.2.1"
-source = "git+https://github.com/drptbl/logos-mcp?rev=67f01f59a03ed0c3bbd38cea6c4d87eca1b18088#67f01f59a03ed0c3bbd38cea6c4d87eca1b18088"
+version = "0.3.0"
+source = "git+https://github.com/drptbl/logos-mcp?rev=22cf51c64a85b3846bb56f29998e5f0dcd06c2a0#22cf51c64a85b3846bb56f29998e5f0dcd06c2a0"
 dependencies = [
  "anyhow",
  "axum",
@@ -706,7 +706,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "tokio",
  "tokio-util",
