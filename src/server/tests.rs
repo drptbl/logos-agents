@@ -3676,3 +3676,76 @@ async fn the_follow_through_runs_once_a_minute_however_often_started() {
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     assert_eq!(passes(), 2);
 }
+
+#[tokio::test]
+async fn a_delivery_with_no_clear_answer_still_sends_its_result_once_it_lands() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    // No reply to the delivery: it may have been sent.
+    let (s, _dir) = services_server(fake.clone());
+    let r = s.service_deliver(deliver_done()).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    let recorded = instruction(&fake.calls_to("lez_core.send_generic_public_transaction")[0]);
+    let recorded_hash: [u8; 32] = recorded[1..33].try_into().unwrap();
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record_with(
+            PROVIDER_ACCOUNT,
+            AGENT_FROM,
+            1_000_000,
+            FAR + 600_000,
+            1,
+            recorded_hash,
+        ),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_deliver {JOB}")]);
+    let result = fake.calls_to("chat_module.send_message")[0][1]
+        .strip_prefix("str:")
+        .unwrap()
+        .to_string();
+    assert_eq!(id32(&protocol::quote_hash(&result)), recorded_hash);
+}
+
+#[tokio::test]
+async fn the_follow_through_leaves_a_job_id_used_twice() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    // The open landed, but the job now shows in a second conversation too:
+    // which provider to tell can't be known.
+    fake.reset(
+        "chat_module.list_conversations",
+        chat(
+            "list_conversations",
+            &format!(
+                r#"[{{"convo_id":"{CONVO}","history_only":false,"kind":"direct","last_activity_ms":1,"message_count":1}},{{"convo_id":"{CONVO}2","history_only":false,"kind":"direct","last_activity_ms":1,"message_count":1}}]"#
+            ),
+        ),
+    );
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
