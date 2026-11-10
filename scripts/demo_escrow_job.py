@@ -2,13 +2,15 @@
 """Paid agent-to-agent job over Logos, through escrow, driven through two
 logos-mcp servers with the service_* tools.
 
-provider: offers a service, quotes the job, records the result in escrow,
-          sends it, then claims the price.
-buyer:    finds the provider, asks for the job, pays into escrow, reads the
+provider: offers a service, quotes the job and records the result in escrow.
+          Its server sends the result once that lands, then claims the price.
+buyer:    finds the provider, asks for the job and pays into escrow. Its
+          server tells the provider once the open lands. Then it reads the
           result.
 
-With --decline, a second job is declined instead: the provider returns it in
-escrow and the buyer takes the money back at once.
+Each tool is called once: the servers take the steps that only wait on the
+chain. With --decline, a second job is declined instead: the provider returns
+it in escrow and the buyer's server takes the money back.
 
 Each side needs its own logosctl session and wallet (lez_core holds one wallet
 per daemon), with lez_core, chat_module and libp2p_module installed. Every
@@ -118,14 +120,8 @@ def paid_job(provider, buyer, chat_address, args, text):
         sys.exit("the quote offers no escrow")
     wait_for(lambda: state(buyer, job) == "quoted", "the quote", 300, 5)
     opened = call(buyer, "buyer", "service_pay", job=job, **{"from": args.buyer_from})
-    log(f"[buyer] escrow open {opened.get('escrow_open_tx')} sent, waiting for it to land")
-
-    def told():
-        # Tells the provider once the open has landed; refused until then.
-        ok, body = buyer.tool("service_pay", job=job, **{"from": args.buyer_from})
-        return ok and body.get("paid")
-    wait_for(told, "the escrow open to land", args.timeout, 60)
-    wait_for(lambda: state(provider, job) == "paid", "the provider to see it paid", 600)
+    log(f"[buyer] escrow open {opened.get('escrow_open_tx')} sent, its server tells the provider once it lands")
+    wait_for(lambda: state(provider, job) == "paid", "the provider to see it paid", args.timeout, 30)
     log(f"[provider] job {job} is paid in escrow")
     return job
 
@@ -171,24 +167,18 @@ def main():
     deliver = {"job": job, "output_text": summary}
     call(provider, "provider", "service_deliver", **deliver)
     until_landed(provider, "provider", "service_deliver", deliver,
-                 lambda: escrow(provider, job) == "delivered", "the delivery to land", args.timeout)
-    call(provider, "provider", "service_deliver", **deliver)
+                 lambda: escrow(provider, job) in ("delivered", "claimed"), "the delivery to land", args.timeout)
     result = wait_for(lambda: (job_in(buyer, job) or {}).get("output") if state(buyer, job) == "delivered" else None,
-                      "the result", 600)
+                      "the provider's server to send the result", 600)
     log(f"[buyer] result: {result['text']}")
-    call(provider, "provider", "service_claim", job=job)
-    until_landed(provider, "provider", "service_claim", {"job": job},
-                 lambda: escrow(provider, job) == "claimed", "the claim to land", args.timeout)
+    wait_for(lambda: escrow(provider, job) == "claimed", "the provider's server to claim the price", args.timeout, 45)
     log("[provider] the price is claimed")
 
     # A declined job: Return moves nothing, then the buyer refunds at once.
     if args.decline:
         job = paid_job(provider, buyer, found["chat_address"], args, "a job to decline")
         call(provider, "provider", "service_reject", job=job, reason="can't do it after all")
-        wait_for(lambda: escrow(buyer, job) == "returned", "the return to land", args.timeout, 45)
-        call(buyer, "buyer", "service_refund", job=job)
-        until_landed(buyer, "buyer", "service_refund", {"job": job},
-                     lambda: escrow(buyer, job) == "refunded", "the refund to land", args.timeout)
+        wait_for(lambda: escrow(buyer, job) == "refunded", "the buyer's server to take the money back", args.timeout, 45)
         log("[buyer] the price is back")
 
     call(provider, "provider", "service_stop", service_id=args.service)
