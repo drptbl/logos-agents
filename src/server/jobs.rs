@@ -26,6 +26,9 @@ const DEADLINE_MARGIN_MS: u64 = 5 * 60 * 1000;
 const MAX_DELIVER_S: u64 = 24 * 60 * 60;
 /// Next to the wallet: payments sent, or maybe sent, before the provider was told.
 const PAYMENTS: &str = "service-payments.json";
+/// Next to the wallet: the output of each recorded delivery, kept until the
+/// result goes out, so the follow-through can send it.
+const RESULTS: &str = "service-results.json";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// How long an escrow call is waited for before it counts as dropped:
@@ -877,6 +880,172 @@ impl AgentServer {
         saved
     }
 
+    /// The output a recorded delivery still has to send.
+    async fn saved_result(&self, job: &str) -> Result<Option<Payload>, String> {
+        let _held = self.services.lock().await;
+        let saved: BTreeMap<String, Payload> =
+            guard::read_side_map(self.base.wallet_side_file(RESULTS))
+                .map_err(|e| format!("{RESULTS} next to the wallet can't be read ({e})"))?;
+        Ok(saved.get(job).cloned())
+    }
+
+    /// Keep (`Some`) or forget (`None`) a job's output until its result goes
+    /// out. Never writes over a file it couldn't read.
+    async fn save_result(&self, job: &str, output: Option<&Payload>) -> Result<(), String> {
+        let _held = self.services.lock().await;
+        let file = self
+            .base
+            .wallet_side_file(RESULTS)
+            .ok_or("no wallet configured")?;
+        let mut saved: BTreeMap<String, Payload> = guard::read_side_map(Some(file.clone()))
+            .map_err(|e| format!("{RESULTS} next to the wallet can't be read ({e})"))?;
+        match output {
+            Some(o) => saved.insert(job.to_string(), o.clone()),
+            None => saved.remove(job),
+        };
+        let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+        guard::write_private(&file, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// One pass over every job, taking the steps that only waited on the
+    /// chain: telling the provider once a payment lands, sending a recorded
+    /// result, claiming and refunding. It never pays, quotes, delivers new
+    /// work or declines. Returns what it did, as `tool job` lines.
+    pub(super) async fn follow_through(&self) -> Vec<String> {
+        let mut done = Vec::new();
+        if !self.base.allows("service_jobs") || self.needs(&["chat", "wallet"]).is_err() {
+            return done;
+        }
+        let Ok(jobs) = self.all_jobs().await else {
+            return done;
+        };
+        let notes = self.with_payments().await.submitted.clone();
+        let pending = self.services.lock().await.pending.clone();
+        for Found {
+            convo,
+            can_send,
+            job,
+        } in jobs
+        {
+            let id = job.job.clone();
+            let step = match (job.role, job.state) {
+                // A payment under way: tell the provider once it has landed.
+                (Role::Buyer, State::Quoted)
+                    if can_send && (notes.contains_key(&id) || pending.contains_key(&id)) =>
+                {
+                    // An escrow payment is noted with its account before it
+                    // is asked for; a transfer needs none.
+                    let from = match notes.get(&id) {
+                        Some(Payment::Escrow { escrow_buyer, .. }) => escrow_buyer.clone(),
+                        _ => String::new(),
+                    };
+                    match self
+                        .one_at_a_time(&id, self.finish_payment(&convo, &job, &from))
+                        .await
+                    {
+                        Ok(Finish::Done(v)) if v["paid"] == true => Some(("service_pay", v)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let step = match (step, job.role, job.state) {
+                (Some(step), ..) => Some(step),
+                // Declined, or nothing delivered by the deadline: take the
+                // money back. `refund` refuses everything else.
+                (None, Role::Buyer, State::Paid | State::Failed | State::Quoted)
+                    if job.escrow_buyer.is_some()
+                        || matches!(notes.get(&id), Some(Payment::Escrow { .. })) =>
+                {
+                    match self
+                        .one_at_a_time(&id, self.refund(JobParams { job: id.clone() }))
+                        .await
+                    {
+                        Ok(v) if v.get("refund_tx").is_some() => Some(("service_refund", v)),
+                        _ => None,
+                    }
+                }
+                // The result went out: collect the payment. A delivery
+                // recorded but never sent isn't claimed.
+                (None, Role::Provider, State::Delivered) if job.escrow_buyer.is_some() => {
+                    self.claim_for_follow_through(&id).await
+                }
+                // Paid: once the recorded delivery lands, send the kept
+                // result. A job the buyer released is claimed as it is.
+                (None, Role::Provider, State::Paid) if job.escrow_buyer.is_some() => {
+                    match self.escrow_state(&job).await {
+                        Some(state @ (JobState::Delivered | JobState::Released)) => {
+                            match self.saved_result(&id).await {
+                                Ok(Some(output)) if can_send => {
+                                    self.send_kept_result(&id, output).await
+                                }
+                                _ if state == JobState::Released => {
+                                    self.claim_for_follow_through(&id).await
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((tool, v)) = step {
+                tracing::info!(job = %id, "follow-through: {tool}");
+                self.base.record_activity(
+                    &format!("auto:{tool}"),
+                    &json!({ "job": id }),
+                    true,
+                    &v.to_string(),
+                );
+                done.push(format!("{tool} {id}"));
+            }
+        }
+        done
+    }
+
+    /// The state of the job's escrow, when it holds the job on its terms.
+    async fn escrow_state(&self, job: &Job) -> Option<JobState> {
+        let e = escrow_job(job, job.escrow_buyer.as_deref()?).ok()??;
+        match self.escrow_record(&e).await {
+            Ok(Some(r)) if e.holds(&r) => Some(r.state),
+            _ => None,
+        }
+    }
+
+    /// Send a recorded delivery's kept result for the follow-through.
+    async fn send_kept_result(&self, id: &str, output: Payload) -> Option<(&'static str, Value)> {
+        let (output_text, output_cid) = match output {
+            Payload::Text(t) => (Some(t), None),
+            Payload::Cid(c) => (None, Some(c)),
+        };
+        let p = DeliverParams {
+            job: id.to_string(),
+            output_text,
+            output_cid,
+        };
+        match self.one_at_a_time(id, self.deliver(p)).await {
+            Ok(v) if v["delivered"] == true => Some(("service_deliver", v)),
+            _ => None,
+        }
+    }
+
+    /// Claim a job's payment for the follow-through.
+    async fn claim_for_follow_through(&self, id: &str) -> Option<(&'static str, Value)> {
+        match self
+            .one_at_a_time(
+                id,
+                self.claim(JobParams {
+                    job: id.to_string(),
+                }),
+            )
+            .await
+        {
+            Ok(v) if v.get("claim_tx").is_some() => Some(("service_claim", v)),
+            _ => None,
+        }
+    }
+
     /// Note the account made for a job in logos-mcp's job-accounts file, so
     /// `wallet_accounts` marks it. Never writes over a file it couldn't read.
     fn record_job_account(&self, account_id: &str, job: &str, service: &str) -> Result<(), String> {
@@ -1339,6 +1508,7 @@ impl AgentServer {
 
     async fn deliver(&self, p: DeliverParams) -> Result<Value, String> {
         let output = payload(p.output_text, p.output_cid, "output")?;
+        let kept = output.clone();
         let (convo, job) = self.find_job(&p.job, Role::Provider).await?;
         if !matches!(job.state, State::Quoted | State::Paid) {
             return Err(
@@ -1389,10 +1559,14 @@ impl AgentServer {
                         )
                         .await
                         .map_err(|err| format!("the delivery wasn't recorded in escrow: {err}"))?;
+                    let note = match self.save_result(&job.job, Some(&kept)).await {
+                        Ok(()) => "recorded: once it lands, this server sends the result and then claims the payment on its own while it runs. To do it sooner, call service_deliver again with the same output once service_jobs shows the escrow delivered, then service_claim".to_string(),
+                        Err(e) => format!("recorded, but the output couldn't be kept ({e}): once service_jobs shows the escrow delivered, call service_deliver again with the same output, then service_claim"),
+                    };
                     return Ok(json!({
                         "job": job.job,
                         "escrow_deliver_tx": tx,
-                        "note": "recorded: once it lands (service_jobs shows the escrow delivered), call service_deliver again with the same output to send the result, then service_claim",
+                        "note": note,
                     }));
                 }
                 JobState::Delivered | JobState::Claimed | JobState::Released => {
@@ -1419,6 +1593,9 @@ impl AgentServer {
             ));
         }
         self.send_message(&convo, &m).await?;
+        if let Err(e) = self.save_result(&job.job, None).await {
+            tracing::warn!("could not forget the sent result of job {}: {e}", job.job);
+        }
         Ok(json!({
             "job": job.job,
             "delivered": true,
