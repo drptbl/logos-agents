@@ -29,6 +29,9 @@ const PAYMENTS: &str = "service-payments.json";
 /// Next to the wallet: the output of each recorded delivery, kept until the
 /// result goes out, so the follow-through can send it.
 const RESULTS: &str = "service-results.json";
+
+/// What the follow-through does, for the agent.
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain about once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// How long an escrow call is waited for before it counts as dropped:
@@ -1599,7 +1602,7 @@ impl AgentServer {
         Ok(json!({
             "job": job.job,
             "delivered": true,
-            "note": escrow.as_ref().map(|_| "collect the payment with service_claim"),
+            "note": escrow.as_ref().map(|_| "this server claims the payment on its own within a few minutes, or collect it now with service_claim"),
         }))
     }
 
@@ -1904,7 +1907,7 @@ impl AgentServer {
                         return Ok(Finish::Done(json!({
                             "job": job.job,
                             "escrow_open_tx": tx,
-                            "note": "approved and sent: call service_pay again once it lands, to tell the provider",
+                            "note": "approved and sent: once it lands, this server tells the provider on its own, or call service_pay again then",
                         })));
                     }
                     self.note_payment(&job.job, Some(Payment::Transfer(Some(tx.clone()))))
@@ -2103,7 +2106,7 @@ impl AgentServer {
                 return Ok(json!({
                     "job": job.job,
                     "escrow_open_tx": tx,
-                    "note": "sent: call service_pay again once it lands, to tell the provider. Opens take minutes to land",
+                    "note": "sent: once it lands, this server tells the provider on its own, or call service_pay again then. Opens take minutes to land",
                 }));
             }
             self.note_payment(&p.job, Some(Payment::Transfer(Some(tx.clone()))))
@@ -2119,7 +2122,7 @@ impl AgentServer {
         Ok(json!({
             "status": sent["status"],
             "request_id": request_id,
-            "note": "the user approves each payment: call service_pay again once they have",
+            "note": "the user approves each payment: once they have, this server finishes it on its own, or call service_pay again then",
         }))
     }
 
@@ -2361,6 +2364,7 @@ impl AgentServer {
         ok(json!({
             "jobs": listed,
             "offers": offers,
+            "follow_through": FOLLOW_THROUGH,
             "warning": (!warning.is_empty()).then(|| warning.join("; ")),
         }))
     }
