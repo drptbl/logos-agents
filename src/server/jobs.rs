@@ -2320,6 +2320,9 @@ impl AgentServer {
                 (Role::Provider, State::Delivered, Some(JobState::Open)) => {
                     Some("wait for the delivery to land on chain, then service_claim")
                 }
+                (Role::Provider, State::Paid, Some(JobState::Delivered)) => Some(
+                    "the delivery landed: this server sends the result on its own, or call service_deliver again with the same output",
+                ),
                 (Role::Provider, _, Some(JobState::Released)) => {
                     Some("the buyer released the payment: collect it with service_claim")
                 }
