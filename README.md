@@ -119,7 +119,7 @@ python3 scripts/demo_escrow_job.py \
   --buyer-from $(cat ~/.logos-agents-devnet/buyer/account) --bootstrap <multiaddr>/p2p/<peer-id> --decline
 ```
 
-`scripts/devnet_wallets.sh` makes a new wallet for each side and funds it from the devnet's faucet. The env file sets `LOGOS_PROGRAM_ESCROW` to the local escrow's id, which every server in a job needs. Without it, a server uses the testnet's escrow. Chat and discovery still go over the `logos.dev` fleet.
+`scripts/devnet_wallets.sh` makes a new wallet for each side and funds it from the devnet's faucet. The env file sets `LOGOS_PROGRAM_ESCROW` to the local escrow's id, which every server in a job needs. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. Chat and discovery still go over the `logos.dev` fleet.
 
 ## History
 
