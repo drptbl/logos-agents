@@ -1329,7 +1329,7 @@ fn escrow_quote_text(provider: &str, expires_at: u64, deadline: u64) -> String {
             expires_at,
             deliver_within_s: 600,
             escrow: Some(protocol::EscrowTerms {
-                program: escrow::PROGRAM_ID.into(),
+                program: escrow::program().id.clone(),
                 provider: provider.into(),
                 deadline,
             }),
@@ -1385,7 +1385,7 @@ fn job_record_paying(
     raw.push(state);
     let data: String = raw.iter().map(|b| format!("{b:02x}")).collect();
     let account =
-        json!({ "nonce": "0", "shards": [{ "program": escrow::PROGRAM_ID_HEX, "data": data }] });
+        json!({ "nonce": "0", "shards": [{ "program": escrow::program().hex, "data": data }] });
     lez(
         "get_account_public",
         &serde_json::to_string(&account.to_string()).unwrap(),
@@ -1452,7 +1452,7 @@ async fn an_escrow_offer_quotes_its_terms() {
     else {
         panic!("no escrow terms: {m:?}");
     };
-    assert_eq!(terms.program, escrow::PROGRAM_ID);
+    assert_eq!(terms.program, escrow::program().id);
     assert_eq!(terms.provider, AGENT_FROM);
     assert_eq!(terms.deadline, expires_at + deliver_within_s * 1000);
 }
@@ -1741,7 +1741,7 @@ async fn escrow_money_moves_even_after_chat_restarted() {
 #[tokio::test]
 async fn an_unknown_escrow_program_is_never_paid() {
     let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000)
-        .replace(escrow::PROGRAM_ID, "11111111111111111111111111111111");
+        .replace(&escrow::program().id, "11111111111111111111111111111111");
     let fake = node();
     fake.set(
         "chat_module.get_messages",
@@ -2634,7 +2634,7 @@ async fn an_escrow_too_close_to_its_deadline_is_not_opened() {
             expires_at: expires,
             deliver_within_s: 60,
             escrow: Some(protocol::EscrowTerms {
-                program: escrow::PROGRAM_ID.into(),
+                program: escrow::program().id.clone(),
                 provider: PROVIDER_ACCOUNT.into(),
                 deadline: expires + 60_000,
             }),
@@ -3174,4 +3174,673 @@ async fn every_tool_is_listed_once() {
     assert_eq!(names.len(), all, "{names:?}");
     assert!(names.iter().any(|n| n == "service_jobs"), "{names:?}");
     assert!(names.iter().any(|n| n == "wallet_transfer"), "{names:?}");
+}
+
+#[tokio::test]
+async fn a_call_the_escrow_has_moved_past_needs_no_poll() {
+    // The delivery landed (the escrow moved from open to delivered), so the
+    // claim goes at once: no status poll, which can block for minutes.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service-in-flight.json"),
+        json!({ JOB: { "tx": "deliver1", "sent_ms": now_ms(), "from": "open" } }).to_string(),
+    )
+    .unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert!(fake.calls_to("lez_core.poll_transaction_status").is_empty());
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+/// The buyer's view of an escrow job it paid, plus any later messages.
+fn buyer_paid_history(deadline: u64, later: &[(bool, &str)]) -> RawOutput {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, deadline - 600_000, deadline);
+    let paid = proto(
+        3,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        },
+    );
+    let mut messages = vec![(true, request_text()), (false, q), (true, paid)];
+    messages.extend(later.iter().map(|(mine, t)| (*mine, t.to_string())));
+    let borrowed: Vec<(bool, &str)> = messages.iter().map(|(m, t)| (*m, t.as_str())).collect();
+    history(&borrowed)
+}
+
+/// Nothing left the agent: no transfer, no escrow call, no chat message.
+fn nothing_sent(fake: &Routed) {
+    assert!(fake.calls_to("lez_core.transfer_public").is_empty());
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn the_follow_through_tells_the_provider_once_the_open_landed() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    // Not landed yet: nobody is told.
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "false"),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_pay {JOB}")]);
+    assert_eq!(s.follow_through().await, Vec::<String>::new());
+    let told = fake.calls_to("chat_module.send_message");
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        sent(&told[0]).body,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        }
+    );
+    // The open was sent once, by the agent.
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_follow_through_finishes_an_approved_escrow_payment() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    groups.send_modify(|g| g.set("ask_before_transfer", true).unwrap());
+    let s = s.with_tool_groups(rx);
+    let b = body(
+        &s.service_pay(CancellationToken::new(), pay())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(b["status"], "awaiting_approval", "{b}");
+    // Waiting for the user: nothing goes out.
+    assert!(s.follow_through().await.is_empty());
+    nothing_sent(&fake);
+
+    let id = b["request_id"].as_str().unwrap();
+    s.base.approve_transfer(id).await.unwrap();
+    // The approved open goes out in the background.
+    while s.base.approval_status(id).unwrap()["state"] != "sent" {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Sent, not landed: noted, not told.
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_pay {JOB}")]);
+    assert_eq!(
+        sent(&fake.calls_to("chat_module.send_message")[0]).body,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        }
+    );
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_follow_through_never_starts_a_payment() {
+    for q in [
+        escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000),
+        quote_text("logos.dev", FAR),
+    ] {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+        fake.set("lez_core.get_account_public", no_job_record());
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("open1"),
+        );
+        let (s, _dir) = services_server(fake.clone());
+        assert!(s.follow_through().await.is_empty());
+        nothing_sent(&fake);
+    }
+    // Nor quotes a request.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_offer(offer()).await.unwrap();
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn the_follow_through_does_not_open_again_after_a_refused_open() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    // Included, yet no job: refused on chain.
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "true"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert!(s.follow_through().await.is_empty());
+    }
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn the_follow_through_sends_a_recorded_result_then_claims() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_deliver(deliver_done()).await.unwrap();
+    let recorded = instruction(&fake.calls_to("lez_core.send_generic_public_transaction")[0]);
+    // Not landed: the result waits.
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+
+    let recorded_hash: [u8; 32] = recorded[1..33].try_into().unwrap();
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record_with(
+            PROVIDER_ACCOUNT,
+            AGENT_FROM,
+            1_000_000,
+            FAR + 600_000,
+            1,
+            recorded_hash,
+        ),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_deliver {JOB}")]);
+    let result = fake.calls_to("chat_module.send_message")[0][1]
+        .strip_prefix("str:")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        id32(&protocol::quote_hash(&result)),
+        recorded_hash,
+        "the result sent is the one recorded"
+    );
+
+    // The result in the conversation: the payment is claimed, once.
+    let q = escrow_quote_text(AGENT_FROM, FAR, FAR + 600_000);
+    let paid = proto(
+        3,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(PROVIDER_ACCOUNT.into()),
+        },
+    );
+    fake.reset(
+        "chat_module.get_messages",
+        history(&[
+            (false, &request_text()),
+            (true, &q),
+            (false, &paid),
+            (true, &result),
+        ]),
+    );
+    fake.reset(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_claim {JOB}")]);
+    let calls = fake.calls_to("lez_core.send_generic_public_transaction");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(instruction(&calls[1])[0], 2, "a claim");
+    assert_eq!(fake.calls_to("chat_module.send_message").len(), 1);
+}
+
+#[tokio::test]
+async fn the_follow_through_claims_a_released_payment() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert_eq!(s.follow_through().await, [format!("service_claim {JOB}")]);
+    assert_eq!(
+        instruction(&fake.calls_to("lez_core.send_generic_public_transaction")[0])[0],
+        2
+    );
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+
+    // Once claimed, nothing more is sent.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 2),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_follow_through_never_claims_a_result_it_did_not_send() {
+    // Delivered on chain, but this server kept no result to send: perhaps
+    // recorded by another, or its file was lost. Nothing goes out.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 1),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(s.follow_through().await.is_empty());
+    nothing_sent(&fake);
+}
+
+#[tokio::test]
+async fn the_follow_through_refunds_a_returned_job() {
+    let failed = proto(
+        4,
+        Body::Failed {
+            reason: "can't do it".into(),
+        },
+    );
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        buyer_paid_history(FAR + 600_000, &[(false, &failed)]),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 5),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("refund1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert_eq!(s.follow_through().await, [format!("service_refund {JOB}")]);
+    let calls = fake.calls_to("lez_core.send_generic_public_transaction");
+    assert_eq!(calls.len(), 1);
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let want = escrow::Instruction::Refund {
+        job_ref: id32(&protocol::quote_hash(&q)),
+        amount: 1_000_000,
+        deadline: 0,
+    };
+    assert_eq!(instruction(&calls[0]), want.encode());
+}
+
+#[tokio::test]
+async fn the_follow_through_refunds_only_past_the_deadline() {
+    // Past the deadline and its margin: refunded.
+    let past = 1_000_000;
+    let fake = node();
+    fake.set("chat_module.get_messages", buyer_paid_history(past, &[]));
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, past, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("refund1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert_eq!(s.follow_through().await, [format!("service_refund {JOB}")]);
+
+    // Inside the margin, or delivered: nothing.
+    let just_past = now_ms() - 3 * 60_000;
+    for (deadline, state) in [(just_past, 0u8), (FAR, 0), (past, 1)] {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            buyer_paid_history(deadline, &[]),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, deadline, state),
+        );
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("refund1"),
+        );
+        let (s, _dir) = services_server(fake.clone());
+        assert!(s.follow_through().await.is_empty());
+        nothing_sent(&fake);
+    }
+}
+
+#[tokio::test]
+async fn the_follow_through_leaves_a_job_another_call_is_working_on() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.services.lock().await.busy.insert(JOB.into());
+    assert!(s.follow_through().await.is_empty());
+    nothing_sent(&fake);
+}
+
+#[tokio::test]
+async fn the_follow_through_keeps_to_the_switches() {
+    for switch in ["services", "chat", "wallet"] {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            provider_escrow_history(FAR + 600_000),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+        );
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("claim1"),
+        );
+        let (s, _dir) = services_server(fake.clone());
+        let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+        groups.send_modify(|g| g.set(switch, false).unwrap());
+        let s = s.with_tool_groups(rx);
+        assert!(s.follow_through().await.is_empty(), "{switch}");
+        nothing_sent(&fake);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_follow_through_runs_once_a_minute_however_often_started() {
+    let fake = node();
+    fake.set("chat_module.get_messages", history(&[]));
+    let (s, _dir) = services_server(fake.clone());
+    s.start_follow_through();
+    s.clone().start_follow_through();
+    let passes = || fake.calls_to("chat_module.list_conversations").len();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(passes(), 1);
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    assert_eq!(passes(), 2);
+}
+
+#[tokio::test]
+async fn a_delivery_with_no_clear_answer_still_sends_its_result_once_it_lands() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    // No reply to the delivery: it may have been sent.
+    let (s, _dir) = services_server(fake.clone());
+    let r = s.service_deliver(deliver_done()).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    let recorded = instruction(&fake.calls_to("lez_core.send_generic_public_transaction")[0]);
+    let recorded_hash: [u8; 32] = recorded[1..33].try_into().unwrap();
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record_with(
+            PROVIDER_ACCOUNT,
+            AGENT_FROM,
+            1_000_000,
+            FAR + 600_000,
+            1,
+            recorded_hash,
+        ),
+    );
+    assert_eq!(s.follow_through().await, [format!("service_deliver {JOB}")]);
+    let result = fake.calls_to("chat_module.send_message")[0][1]
+        .strip_prefix("str:")
+        .unwrap()
+        .to_string();
+    assert_eq!(id32(&protocol::quote_hash(&result)), recorded_hash);
+}
+
+#[tokio::test]
+async fn the_follow_through_leaves_a_job_id_used_twice() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    // The open landed, but the job now shows in a second conversation too:
+    // which provider to tell can't be known.
+    fake.reset(
+        "chat_module.list_conversations",
+        chat(
+            "list_conversations",
+            &format!(
+                r#"[{{"convo_id":"{CONVO}","history_only":false,"kind":"direct","last_activity_ms":1,"message_count":1}},{{"convo_id":"{CONVO}2","history_only":false,"kind":"direct","last_activity_ms":1,"message_count":1}}]"#
+            ),
+        ),
+    );
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn an_open_landing_while_it_is_checked_is_not_taken_as_refused() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("open1"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    s.service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+
+    // Not open when read, included when polled right after: it landed in between.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(true, &request_text()), (false, &q)]),
+    );
+    fake.set("lez_core.get_account_public", no_job_record());
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.poll_transaction_status",
+        lez("poll_transaction_status", "true"),
+    );
+    let s = services_server_in(fake.clone(), dir.path());
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(s.follow_through().await, [format!("service_pay {JOB}")]);
+    assert_eq!(
+        sent(&fake.calls_to("chat_module.send_message")[0]).body,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(AGENT_FROM.into()),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_finished_job_drops_out_of_the_follow_through_with_its_kept_result() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    let (s, dir) = services_server(fake.clone());
+    s.service_deliver(deliver_done()).await.unwrap();
+    let kept = || std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
+    assert!(kept().contains(JOB));
+
+    // The provider returned it after all: the kept result goes, and the
+    // escrow is no longer read.
+    fake.reset(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 5),
+    );
+    assert!(s.follow_through().await.is_empty());
+    assert!(!kept().contains(JOB));
+    let reads = fake.calls_to("lez_core.get_account_public").len();
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(fake.calls_to("lez_core.get_account_public").len(), reads);
+}
+
+#[tokio::test]
+async fn a_job_with_nothing_due_costs_one_escrow_read() {
+    let fake = node();
+    fake.set("chat_module.get_messages", buyer_paid_history(FAR, &[]));
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR, 0),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(fake.calls_to("chat_module.list_conversations").len(), 1);
+    assert_eq!(fake.calls_to("lez_core.get_account_public").len(), 1);
 }

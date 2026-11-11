@@ -32,6 +32,9 @@ const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 
+/// How often the follow-through looks at every job.
+const FOLLOW_THROUGH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn ok(value: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
@@ -73,6 +76,8 @@ pub struct AgentServer {
     quoting: Arc<tokio::sync::Mutex<()>>,
     /// Held while offers are advertised or stopped, so they don't cross.
     advertising: Arc<tokio::sync::Mutex<()>>,
+    /// Set once the follow-through runs: one loop for a server and its clones.
+    following: Arc<std::sync::OnceLock<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -83,8 +88,27 @@ impl AgentServer {
             services: Arc::default(),
             quoting: Arc::default(),
             advertising: Arc::default(),
+            following: Arc::default(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Take the steps that only wait on the chain, for every job, every
+    /// minute from now on: see [`jobs`]. Runs once however often it is
+    /// called, until the tokio runtime it was called in stops.
+    pub fn start_follow_through(&self) {
+        if self.following.set(()).is_err() {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(FOLLOW_THROUGH_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                server.follow_through().await;
+            }
+        });
     }
 
     /// Follow the user's tool switches, as logos-mcp's server does.
@@ -105,6 +129,7 @@ mod tests;
 impl ServerHandler for AgentServer {
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
         self.base.on_initialized(context).await;
+        self.start_follow_through();
     }
 
     async fn list_tools(

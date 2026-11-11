@@ -4,30 +4,78 @@
 //! deadline or the provider returns the job. This module only encodes and
 //! decodes; the server sends and reads through `lez_core`.
 
+use logos_mcp::guard;
 use sha2::{Digest, Sha256};
 
 /// The program deployed on the LEZ testnet (v0.3.1), immutable: logos-escrow
 /// with payout addresses and pull-only payouts (image 1d646179…).
-pub const PROGRAM_ID: &str = "HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d";
-pub const PROGRAM_ID_HEX: &str = "f9eba477278c918fadafbcb4a6463e947d0fd8de344b5431ee0aa3cd41d7e3a4";
+pub const TESTNET_PROGRAM_ID: &str = "HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d";
+
+/// Names another deploy of the same program to use instead, such as a local
+/// devnet's: its id, base58 or hex.
+pub const PROGRAM_ENV: &str = "LOGOS_PROGRAM_ESCROW";
+
+/// The escrow program this server pays into and reads.
+pub struct Program {
+    /// Base58, as quotes name it.
+    pub id: String,
+    /// Hex, as `lez_core` takes it.
+    pub hex: String,
+    bytes: Id,
+}
+
+impl Program {
+    /// The program named by `configured`, or the testnet's when unset. Set
+    /// but blank is refused: it is a mistake, not a choice of the testnet.
+    pub fn parse(configured: Option<&str>) -> Result<Self, String> {
+        let named = configured.map_or(TESTNET_PROGRAM_ID, str::trim);
+        let bad = || format!("{PROGRAM_ENV} is not a program id, base58 or hex: {named}");
+        let hex = guard::public_account_hex(named)
+            .or_else(|_| guard::public_account_hex(&format!("Public/{named}")))
+            .map_err(|_| bad())?;
+        let id = guard::account_id_base58(&hex).ok_or_else(bad)?;
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(Self { id, hex, bytes })
+    }
+}
+
+static PROGRAM: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+
+/// The program [`PROGRAM_ENV`] names.
+fn from_env() -> Result<Program, String> {
+    match std::env::var(PROGRAM_ENV) {
+        Ok(named) => Program::parse(Some(&named)),
+        Err(std::env::VarError::NotPresent) => Program::parse(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{PROGRAM_ENV} is not UTF-8")),
+    }
+}
+
+/// Read the configured program before serving, so a bad id stops the server
+/// at once rather than at its first job.
+pub fn check_env() -> Result<(), String> {
+    if PROGRAM.get().is_none() {
+        let _ = PROGRAM.set(from_env()?);
+    }
+    Ok(())
+}
+
+/// The program from [`PROGRAM_ENV`], or the testnet's. Read once.
+pub fn program() -> &'static Program {
+    PROGRAM.get_or_init(|| from_env().unwrap_or_else(|e| panic!("{e}")))
+}
 
 const JOB_SEED: &[u8; 32] = b"/lez-escrow/v1/JobSeed/000000000";
 const PDA_PREFIX: &[u8; 32] = b"/LEE/v0.2/AccountId/PDA/\0\0\0\0\0\0\0\0";
 
 pub type Id = [u8; 32];
 
-fn program_id() -> Id {
-    let mut id = [0u8; 32];
-    for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&PROGRAM_ID_HEX[2 * i..2 * i + 2], 16).unwrap_or_default();
-    }
-    id
-}
-
 /// The account a buyer's job lives in. Deriving from the buyer too means no
 /// one who learns `job_ref` can open that job first.
 pub fn job_account(buyer: &Id, job_ref: &Id) -> Id {
-    job_account_in(&program_id(), buyer, job_ref)
+    job_account_in(&program().bytes, buyer, job_ref)
 }
 
 /// The job account under `program`.
@@ -139,7 +187,7 @@ impl Instruction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Open,
@@ -207,9 +255,11 @@ impl Record {
 pub fn record_in(account: &str) -> Result<Option<Record>, String> {
     let v: serde_json::Value =
         serde_json::from_str(account).map_err(|e| format!("unreadable account: {e}"))?;
-    let shard = v["shards"]
-        .as_array()
-        .and_then(|shards| shards.iter().find(|s| s["program"] == PROGRAM_ID_HEX));
+    let shard = v["shards"].as_array().and_then(|shards| {
+        shards
+            .iter()
+            .find(|s| s["program"] == program().hex.as_str())
+    });
     let Some(data) = shard.and_then(|s| s["data"].as_str()) else {
         return Ok(None);
     };

@@ -40,13 +40,25 @@ fn record(state: u8, result: Option<[u8; 32]>) -> Vec<u8> {
 }
 
 #[test]
-fn the_program_is_the_deployed_one() {
+fn the_program_is_the_testnet_one_unless_another_is_named() {
     // logos-escrow's README: pull-only payouts with payout addresses (image 1d646179…).
-    assert_eq!(PROGRAM_ID, "HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d");
+    let testnet = Program::parse(None).unwrap();
+    assert_eq!(testnet.id, "HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d");
     assert_eq!(
-        PROGRAM_ID_HEX,
+        testnet.hex,
         "f9eba477278c918fadafbcb4a6463e947d0fd8de344b5431ee0aa3cd41d7e3a4"
     );
+    // Set but blank is a mistake, not the testnet.
+    assert!(Program::parse(Some("  ")).is_err());
+    // Another deploy, named in base58 or hex, comes out in both.
+    let local = Program::parse(Some(RUN_A_PROGRAM)).unwrap();
+    assert_eq!(local.hex, RUN_A_PROGRAM);
+    assert_eq!(Program::parse(Some(&local.id)).unwrap().hex, RUN_A_PROGRAM);
+    assert_ne!(local.id, testnet.id);
+    // A typo is refused, never taken for another program.
+    for bad in ["HpavNGFY0", "Public/xyz", "f9eb"] {
+        assert!(Program::parse(Some(bad)).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -63,7 +75,7 @@ fn derives_the_job_account_the_escrow_does() {
     );
     assert_eq!(
         job_account(&bytes(BUYER), &bytes(JOB_REF)),
-        job_account_in(&bytes(PROGRAM_ID_HEX), &bytes(BUYER), &bytes(JOB_REF))
+        job_account_in(&bytes(&program().hex), &bytes(BUYER), &bytes(JOB_REF))
     );
 }
 
@@ -159,7 +171,7 @@ fn finds_the_record_in_the_programs_shard() {
         "nonce": "0",
         "shards": [
             { "program": "0000000000000000000000000000000000000000000000000000000000000000", "data": "00" },
-            { "program": PROGRAM_ID_HEX, "data": hex(&record(2, Some([4; 32]))) }
+            { "program": program().hex, "data": hex(&record(2, Some([4; 32]))) }
         ]
     })
     .to_string();

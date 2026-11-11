@@ -26,11 +26,11 @@ Services follow the [agent services protocol](docs/services-protocol.md). Quotes
 A job, step by step:
 
 1. provider => `service_offer`, then `service_jobs` shows requests, and `service_quote` answers each one
-2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, call `service_pay` again once the open lands, so the provider is told
-3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, call it again with the same output once the delivery lands, then `service_claim`
-4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, `service_refund` takes the money back
+2. buyer => `service_find` and `service_request`, then `service_pay` once `service_jobs` shows the quote. With escrow, the server tells the provider once the open lands
+3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, the server sends the result once the delivery lands, then claims the price
+4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, the server takes the money back
 
-Escrow steps take a few minutes to land on the testnet. `service_jobs` always says what to call next.
+Escrow steps take a few minutes to land on the testnet. While it runs, the server checks every job about once a minute and takes the steps that only wait on the chain: telling the provider, sending a recorded result, claiming and refunding. It never pays, quotes, delivers new work or declines. Over stdio it runs while your client is connected, and in Basecamp while the module is loaded. Each step is still a tool call, and `service_jobs` always says what to call next, so your agent can do it sooner.
 
 The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
 
@@ -106,6 +106,21 @@ python3 scripts/demo_escrow_job.py \
 ```
 
 A run with `--decline` took about 11 minutes on `logos.dev`.
+
+On a local chain it took about 5 minutes and needs no faucet. [logos-devnet](https://github.com/drptbl/logos-devnet) runs one, and `logos-devnet.toml` sets it up for this repo: the escrow program, from a [logos-escrow](https://github.com/drptbl/logos-escrow) release, and a `logosctl` session for each side:
+
+```bash
+scripts/fetch_escrow.sh
+logos-devnet up
+scripts/devnet_wallets.sh
+source ~/.logos-devnet/env
+python3 scripts/demo_escrow_job.py \
+  --provider-session ~/.logos-devnet/sessions/agents-provider/logosctl --provider-wallet ~/.logos-agents-devnet/provider \
+  --buyer-session ~/.logos-devnet/sessions/agents-buyer/logosctl --buyer-wallet ~/.logos-agents-devnet/buyer \
+  --buyer-from $(cat ~/.logos-agents-devnet/buyer/account) --bootstrap <multiaddr>/p2p/<peer-id> --decline
+```
+
+`scripts/devnet_wallets.sh` makes a new wallet for each side and funds it from the devnet's faucet. The env file sets `LOGOS_PROGRAM_ESCROW` to the local escrow's id, which every server in a job needs. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. Chat and discovery still go over the `logos.dev` fleet.
 
 ## History
 

@@ -26,6 +26,12 @@ const DEADLINE_MARGIN_MS: u64 = 5 * 60 * 1000;
 const MAX_DELIVER_S: u64 = 24 * 60 * 60;
 /// Next to the wallet: payments sent, or maybe sent, before the provider was told.
 const PAYMENTS: &str = "service-payments.json";
+/// Next to the wallet: the output of each recorded delivery, kept until the
+/// result goes out, so the follow-through can send it.
+const RESULTS: &str = "service-results.json";
+
+/// What the follow-through does, for the agent.
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain about once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// How long an escrow call is waited for before it counts as dropped:
@@ -73,6 +79,10 @@ struct InFlight {
     /// `None` when the send had no clear outcome.
     tx: Option<String>,
     sent_ms: u64,
+    /// The escrow's state when the call was sent: once it has moved on, the
+    /// call landed. `None` in entries saved before this was kept.
+    #[serde(default)]
+    from: Option<JobState>,
 }
 
 /// Why nothing is paid or cancelled while `PAYMENTS` can't be read.
@@ -87,6 +97,14 @@ fn unreadable_in_flight(e: &str) -> String {
     format!(
         "{IN_FLIGHT} next to the wallet can't be read ({e}). It records escrow calls that may still land, so no other is sent or written over it: fix or move it, then restart the server"
     )
+}
+
+/// What `finish_payment` found.
+enum Finish {
+    /// It finished, or is still waiting, on a payment already under way.
+    Done(Value),
+    /// No payment was started: only `pay` may make one.
+    NothingStarted,
 }
 
 /// Why an escrow on the quoted terms no longer pays for its job.
@@ -141,7 +159,7 @@ impl EscrowJob {
             deadline: self.deadline,
         };
         ProgramCall {
-            program_id_hex: escrow::PROGRAM_ID_HEX.to_string(),
+            program_id_hex: escrow::program().hex.clone(),
             accounts: vec![id_hex(&self.account)],
             instruction: open.encode(),
             description: format!(
@@ -198,7 +216,7 @@ fn escrow_job(job: &Job, buyer: &str) -> Result<Option<EscrowJob>, String> {
         return Ok(None);
     };
     // Only the known program: a provider could name one that keeps the money.
-    if terms.program != escrow::PROGRAM_ID {
+    if terms.program != escrow::program().id {
         return Err(format!(
             "the quote names escrow program {}, which this server doesn't know: not paying into it",
             terms.program
@@ -269,6 +287,9 @@ pub(super) struct Services {
     in_flight_loaded: bool,
     /// Why `IN_FLIGHT` couldn't be read, as for `payments_unreadable`.
     in_flight_unreadable: Option<String>,
+    /// Jobs the follow-through found over on chain, claimed, refunded or
+    /// returned: it stops reading them.
+    pub(super) settled: BTreeSet<String>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
 }
@@ -657,7 +678,13 @@ impl AgentServer {
             }
             state.in_flight.get(job).cloned()
         };
+        // The escrow moved on from where the earlier call left it: that call
+        // landed, and `seen` is read after it, so there's nothing to wait for.
+        let moved_on = earlier
+            .as_ref()
+            .is_some_and(|f| f.from.is_some_and(|from| from != seen));
         if let Some(f) = earlier
+            && !moved_on
             && now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS
         {
             let Some(tx) = f.tx else {
@@ -702,6 +729,7 @@ impl AgentServer {
             Some(InFlight {
                 tx,
                 sent_ms: now_ms(),
+                from: Some(seen),
             }),
         )
         .await;
@@ -722,7 +750,7 @@ impl AgentServer {
                 &id_hex(signer),
                 &accounts,
                 ix.encode(),
-                escrow::PROGRAM_ID_HEX,
+                &escrow::program().hex,
             )
             .await
     }
@@ -856,6 +884,216 @@ impl AgentServer {
             };
         }
         saved
+    }
+
+    /// The output a recorded delivery still has to send.
+    async fn saved_result(&self, job: &str) -> Result<Option<Payload>, String> {
+        let _held = self.services.lock().await;
+        let saved: BTreeMap<String, Payload> =
+            guard::read_side_map(self.base.wallet_side_file(RESULTS))
+                .map_err(|e| format!("{RESULTS} next to the wallet can't be read ({e})"))?;
+        Ok(saved.get(job).cloned())
+    }
+
+    /// Keep (`Some`) or forget (`None`) a job's output until its result goes
+    /// out. Never writes over a file it couldn't read.
+    async fn save_result(&self, job: &str, output: Option<&Payload>) -> Result<(), String> {
+        let _held = self.services.lock().await;
+        let file = self
+            .base
+            .wallet_side_file(RESULTS)
+            .ok_or("no wallet configured")?;
+        let mut saved: BTreeMap<String, Payload> = guard::read_side_map(Some(file.clone()))
+            .map_err(|e| format!("{RESULTS} next to the wallet can't be read ({e})"))?;
+        match output {
+            Some(o) => saved.insert(job.to_string(), o.clone()),
+            None => saved.remove(job),
+        };
+        let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+        guard::write_private(&file, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// One pass over every job, taking the steps that only waited on the
+    /// chain: telling the provider once a payment lands, sending a recorded
+    /// result, claiming and refunding. It never pays, quotes, delivers new
+    /// work or declines. Returns what it did, as `tool job` lines.
+    pub(super) async fn follow_through(&self) -> Vec<String> {
+        let mut done = Vec::new();
+        if !self.follows_through() {
+            return done;
+        }
+        let Ok(jobs) = self.all_jobs().await else {
+            return done;
+        };
+        // A job id in two conversations is left alone, as the tools leave it.
+        let mut seen = BTreeMap::<String, usize>::new();
+        for f in &jobs {
+            *seen.entry(f.job.job.clone()).or_default() += 1;
+        }
+        let notes = self.with_payments().await.submitted.clone();
+        let (pending, settled) = {
+            let state = self.services.lock().await;
+            (state.pending.clone(), state.settled.clone())
+        };
+        for found in jobs {
+            // The user can switch the tools off while a pass runs.
+            if !self.follows_through() {
+                break;
+            }
+            let id = found.job.job.clone();
+            if seen[&id] > 1 || settled.contains(&id) {
+                continue;
+            }
+            let step = self
+                .follow_through_job(&found, notes.get(&id), pending.contains_key(&id))
+                .await;
+            match step {
+                Ok(Some((tool, v))) => {
+                    tracing::info!(job = %id, "follow-through: {tool}");
+                    self.base.record_activity(
+                        &format!("auto:{tool}"),
+                        &json!({ "job": id }),
+                        true,
+                        &v.to_string(),
+                    );
+                    done.push(format!("{tool} {id}"));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(job = %id, "follow-through: {e}"),
+            }
+        }
+        done
+    }
+
+    /// Whether the switches let the follow-through act.
+    fn follows_through(&self) -> bool {
+        self.base.allows("service_jobs") && self.needs(&["chat", "wallet"]).is_ok()
+    }
+
+    /// The follow-through's step for one job, if the chain has made one due.
+    async fn follow_through_job(
+        &self,
+        found: &Found,
+        note: Option<&Payment>,
+        waiting: bool,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let Found {
+            convo,
+            can_send,
+            job,
+        } = found;
+        let id = job.job.as_str();
+        // A payment under way: tell the provider once it has landed. An
+        // escrow payment is noted with its account before it is asked for; a
+        // transfer needs none.
+        if (job.role, job.state) == (Role::Buyer, State::Quoted)
+            && *can_send
+            && (note.is_some() || waiting)
+        {
+            let from = match note {
+                Some(Payment::Escrow { escrow_buyer, .. }) => escrow_buyer.as_str(),
+                _ => "",
+            };
+            match self
+                .one_at_a_time(id, self.finish_payment(convo, job, from))
+                .await
+            {
+                Ok(Finish::Done(v)) if v["paid"] == true => return Ok(Some(("service_pay", v))),
+                // Not landed yet, or waiting for the user: nothing to log.
+                Ok(_) | Err(_) => {}
+            }
+        }
+        let buyer = job.escrow_buyer.as_deref().or(match note {
+            Some(Payment::Escrow { escrow_buyer, .. }) => Some(escrow_buyer.as_str()),
+            _ => None,
+        });
+        let Some(e) = buyer.map(|b| escrow_job(job, b)).transpose()?.flatten() else {
+            return Ok(None);
+        };
+        // The escrow is read first, so claim and refund are only called when
+        // the chain would take them, and finished jobs drop out.
+        let state = match self.escrow_record(&e).await? {
+            Some(r) if e.holds(&r) => r.state,
+            _ => return Ok(None),
+        };
+        let provider = job.role == Role::Provider;
+        match state {
+            JobState::Claimed | JobState::Refunded => {
+                self.settle(id, provider).await;
+                Ok(None)
+            }
+            JobState::Returned if provider => {
+                self.settle(id, provider).await;
+                Ok(None)
+            }
+            // Declined, or nothing delivered by the deadline: take the money back.
+            JobState::Returned | JobState::Open
+                if !provider
+                    && matches!(job.state, State::Paid | State::Failed | State::Quoted)
+                    && (state == JobState::Returned
+                        || now_ms() >= e.deadline.saturating_add(DEADLINE_MARGIN_MS)) =>
+            {
+                let v = self
+                    .one_at_a_time(id, self.refund(JobParams { job: id.into() }))
+                    .await?;
+                Ok(v.get("refund_tx")
+                    .is_some()
+                    .then_some(("service_refund", v)))
+            }
+            JobState::Delivered | JobState::Released if provider => match job.state {
+                // The result went out: collect the payment.
+                State::Delivered => self.claim_for_follow_through(id).await,
+                // The recorded delivery landed: send the kept result. A
+                // delivery recorded but never sent isn't claimed, unless the
+                // buyer released the payment anyway.
+                State::Paid => match self.saved_result(id).await? {
+                    Some(output) if *can_send => self.send_kept_result(id, output).await,
+                    _ if state == JobState::Released => self.claim_for_follow_through(id).await,
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// A job whose escrow is over: the follow-through stops reading it, and
+    /// a provider forgets any result it still kept.
+    async fn settle(&self, id: &str, provider: bool) {
+        self.services.lock().await.settled.insert(id.to_string());
+        if provider && let Err(e) = self.save_result(id, None).await {
+            tracing::warn!("could not forget the kept result of job {id}: {e}");
+        }
+    }
+
+    /// Send a recorded delivery's kept result for the follow-through.
+    async fn send_kept_result(
+        &self,
+        id: &str,
+        output: Payload,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let (output_text, output_cid) = match output {
+            Payload::Text(t) => (Some(t), None),
+            Payload::Cid(c) => (None, Some(c)),
+        };
+        let p = DeliverParams {
+            job: id.to_string(),
+            output_text,
+            output_cid,
+        };
+        let v = self.one_at_a_time(id, self.deliver(p)).await?;
+        Ok((v["delivered"] == true).then_some(("service_deliver", v)))
+    }
+
+    /// Claim a job's payment for the follow-through.
+    async fn claim_for_follow_through(
+        &self,
+        id: &str,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let v = self
+            .one_at_a_time(id, self.claim(JobParams { job: id.into() }))
+            .await?;
+        Ok(v.get("claim_tx").is_some().then_some(("service_claim", v)))
     }
 
     /// Note the account made for a job in logos-mcp's job-accounts file, so
@@ -1198,7 +1436,7 @@ impl AgentServer {
                 .escrow_account
                 .as_ref()
                 .map(|provider| protocol::EscrowTerms {
-                    program: escrow::PROGRAM_ID.to_string(),
+                    program: escrow::program().id.clone(),
                     provider: provider.clone(),
                     deadline: expires_at + offer.deliver_within_s * 1000,
                 }),
@@ -1320,6 +1558,7 @@ impl AgentServer {
 
     async fn deliver(&self, p: DeliverParams) -> Result<Value, String> {
         let output = payload(p.output_text, p.output_cid, "output")?;
+        let kept = output.clone();
         let (convo, job) = self.find_job(&p.job, Role::Provider).await?;
         if !matches!(job.state, State::Quoted | State::Paid) {
             return Err(
@@ -1359,6 +1598,15 @@ impl AgentServer {
                         result: hash,
                         deadline: e.deadline,
                     };
+                    // Kept before it is recorded: a delivery with no clear
+                    // answer may still land, and then this output goes out.
+                    self.save_result(&job.job, Some(&kept))
+                        .await
+                        .map_err(|err| {
+                            format!(
+                                "the output couldn't be kept, so the delivery isn't recorded: {err}"
+                            )
+                        })?;
                     let tx = self
                         .escrow_send_once(
                             e,
@@ -1373,7 +1621,7 @@ impl AgentServer {
                     return Ok(json!({
                         "job": job.job,
                         "escrow_deliver_tx": tx,
-                        "note": "recorded: once it lands (service_jobs shows the escrow delivered), call service_deliver again with the same output to send the result, then service_claim",
+                        "note": "recorded: once it lands, this server sends the result and then claims the payment on its own while it runs. To do it sooner, call service_deliver again with the same output once service_jobs shows the escrow delivered, then service_claim",
                     }));
                 }
                 JobState::Delivered | JobState::Claimed | JobState::Released => {
@@ -1400,10 +1648,13 @@ impl AgentServer {
             ));
         }
         self.send_message(&convo, &m).await?;
+        if let Err(e) = self.save_result(&job.job, None).await {
+            tracing::warn!("could not forget the sent result of job {}: {e}", job.job);
+        }
         Ok(json!({
             "job": job.job,
             "delivered": true,
-            "note": escrow.as_ref().map(|_| "collect the payment with service_claim"),
+            "note": escrow.as_ref().map(|_| "this server claims the payment on its own within a few minutes, or collect it now with service_claim"),
         }))
     }
 
@@ -1584,19 +1835,11 @@ impl AgentServer {
         }
     }
 
-    async fn pay(&self, ct: &CancellationToken, p: &PayParams) -> Result<Value, String> {
-        self.payments_readable().await?;
-        let (convo, job) = self.find_job(&p.job, Role::Buyer).await?;
-        if job.state != State::Quoted {
-            return Err(
-                format!("job {} is {:?}, not waiting for payment", p.job, job.state).to_lowercase(),
-            );
-        }
+    /// Finish a payment already under way: tell the provider once it has
+    /// landed, or collect one the user approved. Never makes a new payment,
+    /// so the follow-through can call it on its own.
+    async fn finish_payment(&self, convo: &str, job: &Job, from: &str) -> Result<Finish, String> {
         let q = job.quote.clone().ok_or("the job has no quote")?;
-        let price: u128 = q
-            .price_lepta
-            .parse()
-            .map_err(|_| "the quoted price is not a number")?;
         let tell = |tx_hash: String, escrow_buyer: Option<String>| {
             protocol::Message::new(
                 &job.job,
@@ -1610,28 +1853,32 @@ impl AgentServer {
         let unclear = || {
             "a payment for this job may already have gone out, with no clear answer. Not paying again: once service_jobs shows it paid, call service_pay to tell the provider".to_string()
         };
-        let submitted = self.with_payments().await.submitted.get(&p.job).cloned();
+        let submitted = self.with_payments().await.submitted.get(&job.job).cloned();
         // An escrow payment keeps to the account it started from: its job
         // account is derived from it, so another account would open a second one.
         if let Some(Payment::Escrow { escrow_buyer, .. }) = &submitted
-            && account_id(escrow_buyer) != account_id(&p.from)
+            && account_id(escrow_buyer) != account_id(from)
         {
             return Err(format!(
                 "this job's escrow payment goes from {escrow_buyer}: pay from that account"
             ));
         }
         // Through escrow whenever the quote offers it.
-        let escrow = escrow_job(&job, &p.from)?;
+        let escrow = escrow_job(job, from)?;
         // Money that went out, or may have, is never sent again: finish
         // telling the provider instead. Kept across restarts.
         match submitted {
             Some(Payment::Transfer(Some(tx))) => {
-                return self.tell_paid(&convo, &job.job, tell(tx, None)).await;
+                return self
+                    .tell_paid(convo, &job.job, tell(tx, None))
+                    .await
+                    .map(Finish::Done);
             }
             Some(Payment::Transfer(None)) => {
-                return if self.paid_on_chain_by(&job, None).await {
-                    self.tell_paid(&convo, &job.job, tell(String::new(), None))
+                return if self.paid_on_chain_by(job, None).await {
+                    self.tell_paid(convo, &job.job, tell(String::new(), None))
                         .await
+                        .map(Finish::Done)
                 } else {
                     Err(unclear())
                 };
@@ -1645,8 +1892,9 @@ impl AgentServer {
                         }
                         let tx = tx_hash.unwrap_or_default();
                         return self
-                            .tell_paid(&convo, &job.job, tell(tx, Some(p.from.clone())))
-                            .await;
+                            .tell_paid(convo, &job.job, tell(tx, Some(from.to_string())))
+                            .await
+                            .map(Finish::Done);
                     }
                     Ok(Some(_)) => {
                         return Err("this job's escrow account holds a job on other terms".into());
@@ -1672,17 +1920,27 @@ impl AgentServer {
                             "the escrow open {tx} hasn't landed yet: call service_pay again in a few minutes"
                         ));
                     }
-                    self.note_payment(&p.job, None).await;
+                    // It may have landed after the escrow was read above.
+                    match self.escrow_record(e).await {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            return Err(format!(
+                                "the escrow open {tx} has just landed: call service_pay again to tell the provider"
+                            ));
+                        }
+                        Err(err) => return Err(format!("can't read the job's escrow: {err}")),
+                    }
+                    self.note_payment(&job.job, None).await;
                     return Err(format!(
                         "the escrow open {tx} was refused on chain, so nothing is locked: check {} holds the price and the network fee, then call service_pay again",
-                        p.from
+                        from
                     ));
                 }
             }
             None => {}
         }
         // A payment that waited for the user: finish it rather than pay again.
-        let pending = self.services.lock().await.pending.get(&p.job).cloned();
+        let pending = self.services.lock().await.pending.get(&job.job).cloned();
         if let Some(request_id) = pending {
             let status = self
                 .base
@@ -1690,46 +1948,49 @@ impl AgentServer {
                 .unwrap_or(Value::Null);
             match status["state"].as_str() {
                 Some("waiting" | "approved") => {
-                    return Ok(json!({
+                    return Ok(Finish::Done(json!({
                         "status": "awaiting_approval",
                         "request_id": request_id,
                         "note": "the user hasn't approved this payment yet: call service_pay again later",
-                    }));
+                    })));
                 }
                 Some("sent") => {
                     let tx = status["tx_hash"].as_str().unwrap_or_default().to_string();
-                    self.services.lock().await.pending.remove(&p.job);
+                    self.services.lock().await.pending.remove(&job.job);
                     if escrow.is_some() {
                         self.note_payment(
-                            &p.job,
+                            &job.job,
                             Some(Payment::Escrow {
                                 tx_hash: Some(tx.clone()),
-                                escrow_buyer: p.from.clone(),
+                                escrow_buyer: from.to_string(),
                             }),
                         )
                         .await;
-                        return Ok(json!({
+                        return Ok(Finish::Done(json!({
                             "job": job.job,
                             "escrow_open_tx": tx,
-                            "note": "approved and sent: call service_pay again once it lands, to tell the provider",
-                        }));
+                            "note": "approved and sent: once it lands, this server tells the provider on its own, or call service_pay again then",
+                        })));
                     }
-                    self.note_payment(&p.job, Some(Payment::Transfer(Some(tx.clone()))))
+                    self.note_payment(&job.job, Some(Payment::Transfer(Some(tx.clone()))))
                         .await;
-                    return self.tell_paid(&convo, &job.job, tell(tx, None)).await;
+                    return self
+                        .tell_paid(convo, &job.job, tell(tx, None))
+                        .await
+                        .map(Finish::Done);
                 }
                 // Refused or never sent: free to ask again.
                 Some("denied" | "expired" | "cancelled" | "failed") => {
-                    self.services.lock().await.pending.remove(&p.job);
+                    self.services.lock().await.pending.remove(&job.job);
                     if escrow.is_some() {
-                        self.note_payment(&p.job, None).await;
+                        self.note_payment(&job.job, None).await;
                     }
                 }
                 // An unknown outcome, or a receipt no longer kept: it may have gone out.
                 _ => {
-                    self.services.lock().await.pending.remove(&p.job);
+                    self.services.lock().await.pending.remove(&job.job);
                     if escrow.is_none() {
-                        self.note_payment(&p.job, Some(Payment::Transfer(None)))
+                        self.note_payment(&job.job, Some(Payment::Transfer(None)))
                             .await;
                         return Err(unclear());
                     }
@@ -1740,6 +2001,37 @@ impl AgentServer {
                 }
             }
         }
+        Ok(Finish::NothingStarted)
+    }
+
+    async fn pay(&self, ct: &CancellationToken, p: &PayParams) -> Result<Value, String> {
+        self.payments_readable().await?;
+        let (convo, job) = self.find_job(&p.job, Role::Buyer).await?;
+        if job.state != State::Quoted {
+            return Err(
+                format!("job {} is {:?}, not waiting for payment", p.job, job.state).to_lowercase(),
+            );
+        }
+        // A payment already under way is only ever finished, never made again.
+        if let Finish::Done(v) = self.finish_payment(&convo, &job, &p.from).await? {
+            return Ok(v);
+        }
+        let q = job.quote.clone().ok_or("the job has no quote")?;
+        let price: u128 = q
+            .price_lepta
+            .parse()
+            .map_err(|_| "the quoted price is not a number")?;
+        let tell = |tx_hash: String, escrow_buyer: Option<String>| {
+            protocol::Message::new(
+                &job.job,
+                Body::Paid {
+                    quote: q.hash.clone(),
+                    tx_hash,
+                    escrow_buyer,
+                },
+            )
+        };
+        let escrow = escrow_job(&job, &p.from)?;
         // Already paid, for instance before a restart: only tell the provider,
         // even once the quote has expired, since the provider honours it.
         // What can't be read proves nothing either way.
@@ -1876,7 +2168,7 @@ impl AgentServer {
                 return Ok(json!({
                     "job": job.job,
                     "escrow_open_tx": tx,
-                    "note": "sent: call service_pay again once it lands, to tell the provider. Opens take minutes to land",
+                    "note": "sent: once it lands, this server tells the provider on its own, or call service_pay again then. Opens take minutes to land",
                 }));
             }
             self.note_payment(&p.job, Some(Payment::Transfer(Some(tx.clone()))))
@@ -1892,7 +2184,7 @@ impl AgentServer {
         Ok(json!({
             "status": sent["status"],
             "request_id": request_id,
-            "note": "the user approves each payment: call service_pay again once they have",
+            "note": "the user approves each payment: once they have, this server finishes it on its own, or call service_pay again then",
         }))
     }
 
@@ -2067,6 +2359,9 @@ impl AgentServer {
                 (Role::Provider, State::Delivered, Some(JobState::Open)) => {
                     Some("wait for the delivery to land on chain, then service_claim")
                 }
+                (Role::Provider, State::Paid, Some(JobState::Delivered)) => Some(
+                    "the delivery landed: this server sends the result on its own, or call service_deliver again with the same output",
+                ),
                 (Role::Provider, _, Some(JobState::Released)) => {
                     Some("the buyer released the payment: collect it with service_claim")
                 }
@@ -2134,6 +2429,7 @@ impl AgentServer {
         ok(json!({
             "jobs": listed,
             "offers": offers,
+            "follow_through": FOLLOW_THROUGH,
             "warning": (!warning.is_empty()).then(|| warning.join("; ")),
         }))
     }

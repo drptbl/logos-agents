@@ -694,8 +694,8 @@ dependencies = [
 
 [[package]]
 name = "logos-mcp"
-version = "0.3.0"
-source = "git+https://github.com/drptbl/logos-mcp?rev=22cf51c64a85b3846bb56f29998e5f0dcd06c2a0#22cf51c64a85b3846bb56f29998e5f0dcd06c2a0"
+version = "0.3.1"
+source = "git+https://github.com/drptbl/logos-mcp?rev=18fa689fb12f1a80dae44ec37188847cbb252ad6#18fa689fb12f1a80dae44ec37188847cbb252ad6"
 dependencies = [
  "anyhow",
  "axum",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "logos_agents_module"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "logos-agents",

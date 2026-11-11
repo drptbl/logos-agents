@@ -134,6 +134,7 @@ static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::syn
 
 fn start(data_dir: PathBuf) -> Result<(), String> {
     let control = CONTROL.get().ok_or("the data folder was not opened")?;
+    logos_agents::escrow::check_env()?;
     let config = control.config();
     let files = config.files_root(&data_dir)?;
     for peer in &config.discovery_bootstrap {
@@ -159,6 +160,7 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
     ));
     let for_wallet = server.clone();
     let agents = AgentServer::new(server);
+    let following = agents.clone();
     let app = router(move || Ok(agents.clone()), control.tokens());
 
     let stop = STOP
@@ -187,6 +189,9 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
                     }
                 };
                 let _ = tx.send(Ok(()));
+                // Jobs are followed through while the module runs, with or
+                // without a client connected.
+                following.start_follow_through();
                 let served = axum::serve(listener, app)
                     .with_graceful_shutdown(stop.clone().cancelled_owned())
                     .await;

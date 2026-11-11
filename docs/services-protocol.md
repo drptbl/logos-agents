@@ -64,7 +64,7 @@ Since 1.1, a quote may carry `escrow`, which uses [logos-escrow](https://github.
 
 | Field | Value |
 | --- | --- |
-| `program` | the escrow program id, base58: `HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d` |
+| `program` | the escrow program id, base58: `HpavNGFYxjyhLsy171aXsvv146yUeXmRWiho22uvT43d` on the LEZ testnet. Another chain, such as a local devnet, has its own deploy |
 | `provider` | the provider's public account, which the escrow also pays out to |
 | `deadline` | milliseconds since the Unix epoch: exactly `expires_at` plus `deliver_within_s`, which is at most a day. Refuse other values |
 
