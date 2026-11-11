@@ -102,7 +102,7 @@ Run it instead of logos-mcp, not next to it: a server only uses a wallet it open
 python3 scripts/demo_escrow_job.py \
   --provider-session ~/.logosctl-provider --provider-wallet ~/.logos-provider \
   --buyer-session ~/.logosctl-buyer --buyer-wallet ~/.logos-buyer \
-  --buyer-from Public/<base58> --bootstrap <multiaddr>/p2p/<peer-id> --decline
+  --buyer-from Public/<base58> --decline
 ```
 
 A run with `--decline` took about 11 minutes on `logos.dev`.
@@ -112,15 +112,10 @@ On a local chain it took under a minute and needs no faucet. [logos-devnet](http
 ```bash
 scripts/fetch_escrow.sh
 logos-devnet up
-scripts/devnet_wallets.sh
-source ~/.logos-devnet/env
-python3 scripts/demo_escrow_job.py \
-  --provider-session ~/.logos-devnet/sessions/agents-provider/logosctl --provider-wallet ~/.logos-agents-devnet/provider \
-  --buyer-session ~/.logos-devnet/sessions/agents-buyer/logosctl --buyer-wallet ~/.logos-agents-devnet/buyer \
-  --buyer-from $(cat ~/.logos-agents-devnet/buyer/account) --bootstrap <multiaddr>/p2p/<peer-id> --decline --poll 3
+python3 scripts/demo_escrow_job.py --devnet --decline --poll 3
 ```
 
-`scripts/devnet_wallets.sh` makes a new wallet for each side and funds it from the devnet's faucet. `--poll 3` checks every 3 seconds instead of every minute, in the demo and both servers. The env file sets `LOGOS_PROGRAM_ESCROW` to the local escrow's id, which every server in a job needs. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. Chat and discovery still go over the `logos.dev` fleet.
+With `--devnet`, the demo gives each side a new wallet funded from the devnet's faucet, and runs both servers with the devnet's `LOGOS_PROGRAM_ESCROW`, the local escrow's id. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. `--poll 3` checks every 3 seconds instead of every minute, in the demo and both servers. Chat and discovery still go over the `logos.dev` fleet.
 
 ## History
 
