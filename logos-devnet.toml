@@ -2,9 +2,9 @@
 # `source <(logos-devnet env)`. See https://github.com/drptbl/logos-devnet.
 
 [programs]
-# logos-escrow's guest binary (image 1d646179…): clone
-# https://github.com/drptbl/logos-escrow to ../lez-escrow and run `make build` there.
-escrow = "../lez-escrow/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/logos_escrow.bin"
+# logos-escrow's released guest binary (image 1d646179…): scripts/fetch_escrow.sh
+# downloads it and checks its sha256.
+escrow = "target/escrow/logos_escrow.bin"
 
 # One logosctl session per side of a job, as scripts/demo_escrow_job.py takes them.
 [sessions.agents-provider]
