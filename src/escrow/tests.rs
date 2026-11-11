@@ -48,7 +48,8 @@ fn the_program_is_the_testnet_one_unless_another_is_named() {
         testnet.hex,
         "f9eba477278c918fadafbcb4a6463e947d0fd8de344b5431ee0aa3cd41d7e3a4"
     );
-    assert_eq!(Program::parse(Some("  ")).unwrap().id, testnet.id);
+    // Set but blank is a mistake, not the testnet.
+    assert!(Program::parse(Some("  ")).is_err());
     // Another deploy, named in base58 or hex, comes out in both.
     let local = Program::parse(Some(RUN_A_PROGRAM)).unwrap();
     assert_eq!(local.hex, RUN_A_PROGRAM);

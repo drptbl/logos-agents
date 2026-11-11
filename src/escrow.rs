@@ -25,10 +25,10 @@ pub struct Program {
 }
 
 impl Program {
-    /// The program named by `configured`, or the testnet's when unset.
+    /// The program named by `configured`, or the testnet's when unset. Set
+    /// but blank is refused: it is a mistake, not a choice of the testnet.
     pub fn parse(configured: Option<&str>) -> Result<Self, String> {
-        let given = configured.map(str::trim).filter(|s| !s.is_empty());
-        let named = given.unwrap_or(TESTNET_PROGRAM_ID);
+        let named = configured.map_or(TESTNET_PROGRAM_ID, str::trim);
         let bad = || format!("{PROGRAM_ENV} is not a program id, base58 or hex: {named}");
         let hex = guard::public_account_hex(named)
             .or_else(|_| guard::public_account_hex(&format!("Public/{named}")))
@@ -42,18 +42,29 @@ impl Program {
     }
 }
 
-/// Check the configured program before serving, so a bad id stops the server
+static PROGRAM: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+
+/// The program [`PROGRAM_ENV`] names.
+fn from_env() -> Result<Program, String> {
+    match std::env::var(PROGRAM_ENV) {
+        Ok(named) => Program::parse(Some(&named)),
+        Err(std::env::VarError::NotPresent) => Program::parse(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{PROGRAM_ENV} is not UTF-8")),
+    }
+}
+
+/// Read the configured program before serving, so a bad id stops the server
 /// at once rather than at its first job.
 pub fn check_env() -> Result<(), String> {
-    Program::parse(std::env::var(PROGRAM_ENV).ok().as_deref()).map(|_| ())
+    if PROGRAM.get().is_none() {
+        let _ = PROGRAM.set(from_env()?);
+    }
+    Ok(())
 }
 
 /// The program from [`PROGRAM_ENV`], or the testnet's. Read once.
 pub fn program() -> &'static Program {
-    static PROGRAM: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
-    PROGRAM.get_or_init(|| {
-        Program::parse(std::env::var(PROGRAM_ENV).ok().as_deref()).unwrap_or_else(|e| panic!("{e}"))
-    })
+    PROGRAM.get_or_init(|| from_env().unwrap_or_else(|e| panic!("{e}")))
 }
 
 const JOB_SEED: &[u8; 32] = b"/lez-escrow/v1/JobSeed/000000000";
