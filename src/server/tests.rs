@@ -1329,7 +1329,7 @@ fn escrow_quote_text(provider: &str, expires_at: u64, deadline: u64) -> String {
             expires_at,
             deliver_within_s: 600,
             escrow: Some(protocol::EscrowTerms {
-                program: escrow::PROGRAM_ID.into(),
+                program: escrow::program().id.clone(),
                 provider: provider.into(),
                 deadline,
             }),
@@ -1385,7 +1385,7 @@ fn job_record_paying(
     raw.push(state);
     let data: String = raw.iter().map(|b| format!("{b:02x}")).collect();
     let account =
-        json!({ "nonce": "0", "shards": [{ "program": escrow::PROGRAM_ID_HEX, "data": data }] });
+        json!({ "nonce": "0", "shards": [{ "program": escrow::program().hex, "data": data }] });
     lez(
         "get_account_public",
         &serde_json::to_string(&account.to_string()).unwrap(),
@@ -1452,7 +1452,7 @@ async fn an_escrow_offer_quotes_its_terms() {
     else {
         panic!("no escrow terms: {m:?}");
     };
-    assert_eq!(terms.program, escrow::PROGRAM_ID);
+    assert_eq!(terms.program, escrow::program().id);
     assert_eq!(terms.provider, AGENT_FROM);
     assert_eq!(terms.deadline, expires_at + deliver_within_s * 1000);
 }
@@ -1741,7 +1741,7 @@ async fn escrow_money_moves_even_after_chat_restarted() {
 #[tokio::test]
 async fn an_unknown_escrow_program_is_never_paid() {
     let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000)
-        .replace(escrow::PROGRAM_ID, "11111111111111111111111111111111");
+        .replace(&escrow::program().id, "11111111111111111111111111111111");
     let fake = node();
     fake.set(
         "chat_module.get_messages",
@@ -2634,7 +2634,7 @@ async fn an_escrow_too_close_to_its_deadline_is_not_opened() {
             expires_at: expires,
             deliver_within_s: 60,
             escrow: Some(protocol::EscrowTerms {
-                program: escrow::PROGRAM_ID.into(),
+                program: escrow::program().id.clone(),
                 provider: PROVIDER_ACCOUNT.into(),
                 deadline: expires + 60_000,
             }),

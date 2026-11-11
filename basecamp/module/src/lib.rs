@@ -134,6 +134,7 @@ static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::syn
 
 fn start(data_dir: PathBuf) -> Result<(), String> {
     let control = CONTROL.get().ok_or("the data folder was not opened")?;
+    logos_agents::escrow::check_env()?;
     let config = control.config();
     let files = config.files_root(&data_dir)?;
     for peer in &config.discovery_bootstrap {

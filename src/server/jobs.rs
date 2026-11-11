@@ -159,7 +159,7 @@ impl EscrowJob {
             deadline: self.deadline,
         };
         ProgramCall {
-            program_id_hex: escrow::PROGRAM_ID_HEX.to_string(),
+            program_id_hex: escrow::program().hex.clone(),
             accounts: vec![id_hex(&self.account)],
             instruction: open.encode(),
             description: format!(
@@ -216,7 +216,7 @@ fn escrow_job(job: &Job, buyer: &str) -> Result<Option<EscrowJob>, String> {
         return Ok(None);
     };
     // Only the known program: a provider could name one that keeps the money.
-    if terms.program != escrow::PROGRAM_ID {
+    if terms.program != escrow::program().id {
         return Err(format!(
             "the quote names escrow program {}, which this server doesn't know: not paying into it",
             terms.program
@@ -750,7 +750,7 @@ impl AgentServer {
                 &id_hex(signer),
                 &accounts,
                 ix.encode(),
-                escrow::PROGRAM_ID_HEX,
+                &escrow::program().hex,
             )
             .await
     }
@@ -1436,7 +1436,7 @@ impl AgentServer {
                 .escrow_account
                 .as_ref()
                 .map(|provider| protocol::EscrowTerms {
-                    program: escrow::PROGRAM_ID.to_string(),
+                    program: escrow::program().id.clone(),
                     provider: provider.clone(),
                     deadline: expires_at + offer.deliver_within_s * 1000,
                 }),

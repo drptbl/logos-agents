@@ -3,6 +3,7 @@ use logos_mcp::standalone::{App, run};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    logos_agents::escrow::check_env().map_err(anyhow::Error::msg)?;
     run(
         App {
             name: "logos-agents",
