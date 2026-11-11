@@ -31,7 +31,7 @@ const PAYMENTS: &str = "service-payments.json";
 const RESULTS: &str = "service-results.json";
 
 /// What the follow-through does, for the agent.
-const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain about once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// How long an escrow call is waited for before it counts as dropped:

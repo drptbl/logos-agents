@@ -3844,3 +3844,16 @@ async fn a_job_with_nothing_due_costs_one_escrow_read() {
     assert_eq!(fake.calls_to("chat_module.list_conversations").len(), 1);
     assert_eq!(fake.calls_to("lez_core.get_account_public").len(), 1);
 }
+
+#[test]
+fn the_follow_through_interval_is_whole_seconds_within_an_hour() {
+    use std::time::Duration;
+    assert_eq!(parse_follow_through("5"), Ok(Duration::from_secs(5)));
+    assert_eq!(
+        parse_follow_through(" 3600 "),
+        Ok(Duration::from_secs(3600))
+    );
+    for bad in ["0", "3601", "1.5", "", "-1", "fast"] {
+        assert!(parse_follow_through(bad).is_err(), "{bad}");
+    }
+}
