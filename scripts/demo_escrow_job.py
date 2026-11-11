@@ -23,15 +23,23 @@ provider's session between runs: logosctl module reload libp2p_module. A
 server only uses a wallet it opened itself, so if another logos-mcp server
 used a session since lez_core loaded, reload lez_core there too.
 
+With --devnet, it runs on the local devnet that `logos-devnet up` starts from
+logos-devnet.toml instead: the sessions, a funded wallet per side and the escrow
+id come from it, and only logos-devnet and logosctl need to be on PATH.
+
 Exits non-zero if a job does not complete.
 """
 import argparse
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPTS)
 from e2e import Client  # noqa: E402
 
 # Seconds between checks, for the demo and both servers' follow-through. None
@@ -62,6 +70,52 @@ def start(name, bin_, session, wallet_dir, bootstrap, preset, log_dir):
 
 def log(*parts):
     print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+FLEETS = "https://fleets.logos.co/data.json"
+
+
+def fleet_peers():
+    """logos.dev's discovery peers from the fleet list, or from scripts/logos-dev-peers.txt
+    when the list doesn't answer."""
+    for _ in range(3):
+        try:
+            # The site refuses Python's default User-Agent.
+            ask = urllib.request.Request(FLEETS, headers={"User-Agent": "logos-agents-demo"})
+            with urllib.request.urlopen(ask, timeout=20) as r:
+                nodes = json.load(r)["logos.dev"]["logos-node-delivery"].values()
+            peers = [n["ServiceMeta"]["libp2p_multiaddr"] + "/p2p/" + n["ServiceMeta"]["libp2p_peer_id"]
+                     for n in nodes if n["ServiceMeta"].get("libp2p_peer_id")]
+            if peers:
+                return ",".join(peers)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log(f"the fleet list failed: {e}")
+        time.sleep(5)
+    log("using scripts/logos-dev-peers.txt instead")
+    with open(os.path.join(SCRIPTS, "logos-dev-peers.txt")) as f:
+        return ",".join(line.strip() for line in f if line.strip() and not line.startswith("#"))
+
+
+def devnet(*args):
+    """A logos-devnet command's JSON output."""
+    out = subprocess.run(["logos-devnet", "--json", *args], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)
+
+
+def on_devnet(args):
+    """Fills in sessions, wallets and the escrow id from the devnet that `logos-devnet up`
+    started from logos-devnet.toml: both servers take its env, and each side gets a new
+    wallet, funded from its faucet."""
+    os.environ.update(devnet("env"))
+    for side in ("provider", "buyer"):
+        setattr(args, f"{side}_session", devnet("session", "env", f"agents-{side}")["LOGOSCTL_CONFIG_DIR"])
+    wallets = tempfile.mkdtemp(prefix="logos-agents-devnet-wallets-")
+    made = subprocess.run([os.path.join(SCRIPTS, "devnet_wallets.sh"), wallets],
+                          capture_output=True, text=True, check=True)
+    args.provider_wallet = os.path.join(wallets, "provider")
+    args.buyer_wallet = os.path.join(wallets, "buyer")
+    args.buyer_from = made.stdout.strip()
+    log(f"devnet wallets in {wallets}, buyer {args.buyer_from}")
 
 
 def call(c, who, tool, **args):
@@ -135,14 +189,16 @@ def paid_job(provider, buyer, chat_address, args, text):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default="target/debug/logos-agents")
-    ap.add_argument("--provider-session", required=True)
-    ap.add_argument("--provider-wallet", required=True, help="folder with wallet_config.json and storage.json")
+    ap.add_argument("--devnet", action="store_true",
+                    help="run on the devnet logos-devnet.toml sets up: sessions, wallets and the escrow come from it")
+    ap.add_argument("--provider-session")
+    ap.add_argument("--provider-wallet", help="folder with wallet_config.json and storage.json")
     ap.add_argument("--provider-escrow", help="provider's Public/<base58> account escrow pays (default: its best-funded)")
-    ap.add_argument("--buyer-session", required=True)
-    ap.add_argument("--buyer-wallet", required=True)
-    ap.add_argument("--buyer-from", required=True,
+    ap.add_argument("--buyer-session")
+    ap.add_argument("--buyer-wallet")
+    ap.add_argument("--buyer-from",
                     help="buyer's Public/<base58> account, holding the price plus the network's fee reserve")
-    ap.add_argument("--bootstrap", required=True, help="comma-separated /p2p/ discovery multiaddrs")
+    ap.add_argument("--bootstrap", help="comma-separated /p2p/ discovery multiaddrs (default: logos.dev's)")
     ap.add_argument("--preset", default="logos.dev")
     ap.add_argument("--price", default="1000000", help="lepta per job")
     ap.add_argument("--service", default=f"logos-mcp-demo/summarize/v{int(time.time())}")
@@ -153,6 +209,14 @@ def main():
     args = ap.parse_args()
     global POLL
     POLL = args.poll
+    if args.devnet:
+        on_devnet(args)
+    missing = [f"--{a.replace('_', '-')}" for a in
+               ("provider_session", "provider_wallet", "buyer_session", "buyer_wallet", "buyer_from")
+               if not getattr(args, a)]
+    if missing:
+        ap.error(f"{', '.join(missing)} needed, or --devnet")
+    args.bootstrap = args.bootstrap or fleet_peers()
 
     logs = tempfile.mkdtemp(prefix="logos-mcp-demo-")
     provider = start("provider", args.bin, args.provider_session, args.provider_wallet, args.bootstrap, args.preset, logs)

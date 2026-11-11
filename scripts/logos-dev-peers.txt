@@ -1,0 +1,8 @@
+# logos.dev's discovery peers, as https://fleets.logos.co/data.json listed them on 2026-11-10.
+# scripts/demo_escrow_job.py falls back to these when that list doesn't answer.
+/ip4/138.68.122.137/tcp/30304/p2p/16Uiu2HAm1YeKNp72mcWY3GD2FdkGLk85XVBHMpuGooPNEuzW5Ajc
+/ip4/174.138.106.244/tcp/30304/p2p/16Uiu2HAm885xc8JetRzjKpgGTSb2WN7DoS3hFpCDjQhWoieR7dyS
+/ip4/136.119.156.87/tcp/30304/p2p/16Uiu2HAmBPzDQQ43Nwr8cTtGF4aCACZq4HoGrHpDj9bQDT7fB5mm
+/ip4/34.123.201.25/tcp/30304/p2p/16Uiu2HAmGRHVRJRUCwng69ynaicTKwtSZZpUdLYEyKcmzaZ936XT
+/ip4/47.242.130.189/tcp/30304/p2p/16Uiu2HAkvoH9inWGTmVxL4TDKYFqNZEfoLP3zmeuNSVkiknkTbPF
+/ip4/43.99.103.10/tcp/30304/p2p/16Uiu2HAmGBJ6wbRC2QGJreX3bA25g5yhMFajNVVKM9483CgcPkSu
