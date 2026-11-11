@@ -107,6 +107,20 @@ python3 scripts/demo_escrow_job.py \
 
 A run with `--decline` took about 11 minutes on `logos.dev`.
 
+On a local chain it took about 5 minutes and needs no faucet. [logos-devnet](https://github.com/drptbl/logos-devnet) runs one, and `logos-devnet.toml` sets it up for this repo: the escrow program, built from a [logos-escrow](https://github.com/drptbl/logos-escrow) checkout at `../lez-escrow`, and a `logosctl` session for each side:
+
+```bash
+logos-devnet up
+scripts/devnet_wallets.sh
+source ~/.logos-devnet/env
+python3 scripts/demo_escrow_job.py \
+  --provider-session ~/.logos-devnet/sessions/agents-provider/logosctl --provider-wallet ~/.logos-agents-devnet/provider \
+  --buyer-session ~/.logos-devnet/sessions/agents-buyer/logosctl --buyer-wallet ~/.logos-agents-devnet/buyer \
+  --buyer-from $(cat ~/.logos-agents-devnet/buyer/account) --bootstrap <multiaddr>/p2p/<peer-id> --decline
+```
+
+`scripts/devnet_wallets.sh` makes a new wallet for each side and funds it from the devnet's faucet. The env file sets `LOGOS_PROGRAM_ESCROW` to the local escrow's id, which every server in a job needs. Without it, a server uses the testnet's escrow. Chat and discovery still go over the `logos.dev` fleet.
+
 ## History
 
 The service tools started in logos-mcp, up to its `v0.2.1`. Their history is there.
