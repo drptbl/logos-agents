@@ -15,6 +15,7 @@ on:
       - scripts/demo_escrow_job.py
       - scripts/devnet_wallets.sh
       - scripts/fetch_escrow.sh
+      - scripts/logos-dev-peers.txt
 
 permissions:
   contents: read
@@ -22,10 +23,6 @@ permissions:
 concurrency:
   group: devnet-demo-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  LOGOSCTL_VERSION: "0.3.2"
-  LOGOSCTL_SHA256: 294fbcc6409a8851b7471582bdad2dbfaf681b5d1c67dfffec38ada925dc6762
 
 jobs:
   demo:
@@ -41,48 +38,24 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked
-      # logosctl ships as an AppImage. Extracted, it runs without FUSE.
+      # logosctl 0.3.2 ships as an AppImage. Extracted, it runs without FUSE.
       - name: Install logosctl
         run: |
           dir="$RUNNER_TEMP/logosctl"
-          mkdir -p "$dir/bin"
-          cd "$dir"
-          curl -fsSL -o logosctl.tar.gz "https://github.com/logos-co/logos-logoscore-cli/releases/download/$LOGOSCTL_VERSION/logosctl-x86_64-linux.tar.gz"
-          echo "$LOGOSCTL_SHA256  logosctl.tar.gz" | sha256sum -c -
-          tar xzf logosctl.tar.gz
-          ./logosctl-x86_64.AppImage --appimage-extract >/dev/null
-          printf '#!/bin/sh\nexec "%s/squashfs-root/AppRun" "$@"\n' "$dir" > bin/logosctl
-          chmod +x bin/logosctl
+          mkdir -p "$dir/bin" && cd "$dir"
+          curl -fsSL -o logosctl.tar.gz https://github.com/logos-co/logos-logoscore-cli/releases/download/0.3.2/logosctl-x86_64-linux.tar.gz
+          echo "294fbcc6409a8851b7471582bdad2dbfaf681b5d1c67dfffec38ada925dc6762  logosctl.tar.gz" | sha256sum -c -
+          tar xzf logosctl.tar.gz && ./logosctl-x86_64.AppImage --appimage-extract >/dev/null
+          printf '#!/bin/sh\nexec "%s/squashfs-root/AppRun" "$@"\n' "$dir" > bin/logosctl && chmod +x bin/logosctl
           echo "$dir/bin" >> "$GITHUB_PATH"
-      - run: logosctl --version
       - run: scripts/fetch_escrow.sh
       # Starts the devnet from logos-devnet.toml: the escrow and a logosctl session per side.
-      - uses: drptbl/logos-devnet@v0.3.4
-      - name: Fund a wallet for each side
-        run: echo "BUYER=$(scripts/devnet_wallets.sh "$RUNNER_TEMP/wallets")" >> "$GITHUB_ENV"
-      - name: Find the logos.dev discovery peers
-        run: |
-          curl -fsSL https://fleets.logos.co/data.json | python3 -I -c '
-          import json, sys
-          nodes = json.load(sys.stdin)["logos.dev"]["logos-node-delivery"].values()
-          print("BOOTSTRAP=" + ",".join(n["ServiceMeta"]["libp2p_multiaddr"] + "/p2p/" + n["ServiceMeta"]["libp2p_peer_id"]
-                                       for n in nodes if n["ServiceMeta"].get("libp2p_peer_id")))' >> "$GITHUB_ENV"
-      - name: Run a delivered and a declined job
-        run: |
-          python3 scripts/demo_escrow_job.py \
-            --provider-session "$HOME/.logos-devnet/sessions/agents-provider/logosctl" --provider-wallet "$RUNNER_TEMP/wallets/provider" \
-            --buyer-session "$HOME/.logos-devnet/sessions/agents-buyer/logosctl" --buyer-wallet "$RUNNER_TEMP/wallets/buyer" \
-            --buyer-from "$BUYER" --bootstrap "$BOOTSTRAP" --decline --poll 3 --timeout 600
-      # The demo keeps each server's log in a logos-mcp-demo-* folder under /tmp.
-      - name: Keep the logs
-        if: always()
-        run: |
-          mkdir -p "$RUNNER_TEMP/demo-logs"
-          cp -r /tmp/logos-mcp-demo-* "$RUNNER_TEMP/demo-logs/" 2>/dev/null || true
-          logos-devnet logs > "$RUNNER_TEMP/demo-logs/sequencer.log" 2>&1 || true
+      - uses: drptbl/logos-devnet@v0.3.5
+      - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
+      # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: devnet-demo-logs
-          path: ${{ runner.temp }}/demo-logs
+          path: /tmp/logos-mcp-demo-*
           if-no-files-found: ignore
