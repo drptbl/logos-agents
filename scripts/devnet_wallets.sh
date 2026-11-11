@@ -24,15 +24,15 @@ while n:
 print("1" * (len(raw) - len(raw.lstrip(b"\0"))) + out)' "$1"
 }
 
-# The result of a logosctl call. The recovery phrase create_new returns is
-# never printed: these wallets only ever hold devnet lepta.
+# The result of a logosctl call. Its reply is never printed, even on failure:
+# create_new's carries the wallet's recovery phrase.
 result() {
   python3 -I -c '
 import json, sys
 r = json.load(sys.stdin)
 if r.get("status") != "ok":
-    sys.exit(f"logosctl: {r}")
-print(r["result"])'
+    sys.exit(f"logosctl {sys.argv[1]} failed")
+print(r["result"])' "$1"
 }
 
 for side in provider buyer; do
@@ -41,12 +41,17 @@ for side in provider buyer; do
     echo "$wallet already holds a wallet: remove it, or pass another dir" >&2
     exit 1
   fi
-  export LOGOSCTL_CONFIG_DIR="$HOME/.logos-devnet/sessions/agents-$side/logosctl"
+  export LOGOSCTL_CONFIG_DIR="${LOGOS_DEVNET_HOME:-$HOME/.logos-devnet}/sessions/agents-$side/logosctl"
+  if [[ ! -d "$LOGOSCTL_CONFIG_DIR" ]]; then
+    echo "no logos-devnet session agents-$side: run logos-devnet up in this repo first" >&2
+    exit 1
+  fi
   logos-devnet wallet-config "$wallet" >/dev/null
   logosctl module reload lez_core >/dev/null
-  logosctl call lez_core create_new "str:$wallet/wallet_config.json" "str:$wallet/storage.json" str: | result >/dev/null
-  account="Public/$(base58 "$(logosctl call lez_core create_account_public | result)")"
-  logosctl call lez_core save | result >/dev/null
+  logosctl call lez_core create_new "str:$wallet/wallet_config.json" "str:$wallet/storage.json" str: | result create_new >/dev/null
+  hex=$(logosctl call lez_core create_account_public | result create_account_public)
+  account="Public/$(base58 "$hex")"
+  logosctl call lez_core save | result save >/dev/null
   logosctl module reload lez_core >/dev/null
   logos-devnet fund "$account" >/dev/null
   echo "$account" >"$wallet/account"
