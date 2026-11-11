@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 # The library from this repo, copied here by flake.nix (locally a gitignored symlink).
 logos-agents = { path = "vendor/logos-agents", default-features = false }
 # The same logos-mcp logos-agents builds on, with the module support it needs.
-logos-mcp = { git = "https://github.com/drptbl/logos-mcp", rev = "18fa689fb12f1a80dae44ec37188847cbb252ad6", default-features = false, features = ["module"] }
+logos-mcp = { git = "https://github.com/drptbl/logos-mcp", rev = "e05e9c3b1d98bb6133a6a73132194c945386151d", default-features = false, features = ["module"] }
 # Staged by the builder, same rev as the generator.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
