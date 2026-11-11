@@ -34,6 +34,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e import Client  # noqa: E402
 
+# Seconds between checks, for the demo and both servers' follow-through. None
+# keeps each wait's own pace and the servers' default of a minute.
+POLL = None
+
 DOCUMENT = ("Logos is a privacy-first stack for decentralised apps. It combines a blockchain with "
             "private execution, peer-to-peer messaging, content-addressed storage and a mixnet.")
 
@@ -47,6 +51,8 @@ def start(name, bin_, session, wallet_dir, bootstrap, preset, log_dir):
         LOGOS_MCP_WALLET_STORAGE=os.path.join(wallet_dir, "storage.json"),
         LOGOS_MCP_DISCOVERY_BOOTSTRAP=bootstrap,
     )
+    if POLL:
+        env["LOGOS_AGENTS_FOLLOW_THROUGH_SECS"] = str(POLL)
     c = Client([bin_], env, open(os.path.join(log_dir, f"{name}.log"), "w"))
     c.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                              "clientInfo": {"name": name, "version": "0"}})
@@ -72,7 +78,7 @@ def wait_for(fn, what, timeout, every=15):
         value = fn()
         if value:
             return value
-        time.sleep(every)
+        time.sleep(POLL or every)
     sys.exit(f"timed out waiting for {what}")
 
 
@@ -93,7 +99,7 @@ def until_landed(c, who, tool, args, landed, what, timeout):
             ok, body = c.tool(tool, **args)
             log(f"[{who}] {tool} again: {'sent' if ok else body}")
             tried = time.time()
-        time.sleep(45)
+        time.sleep(POLL or 45)
     sys.exit(f"timed out waiting for {what}")
 
 
@@ -142,7 +148,11 @@ def main():
     ap.add_argument("--service", default=f"logos-mcp-demo/summarize/v{int(time.time())}")
     ap.add_argument("--decline", action="store_true", help="also run a job the provider declines")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds to wait for each escrow step")
+    ap.add_argument("--poll", type=int, help="seconds between checks, for the demo and both servers: "
+                    "a few suit a local devnet, whose blocks land in a second")
     args = ap.parse_args()
+    global POLL
+    POLL = args.poll
 
     logs = tempfile.mkdtemp(prefix="logos-mcp-demo-")
     provider = start("provider", args.bin, args.provider_session, args.provider_wallet, args.bootstrap, args.preset, logs)
