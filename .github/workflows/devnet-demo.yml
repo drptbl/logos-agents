@@ -38,19 +38,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked
-      # logosctl 0.3.2 ships as an AppImage. Extracted, it runs without FUSE.
-      - name: Install logosctl
-        run: |
-          dir="$RUNNER_TEMP/logosctl"
-          mkdir -p "$dir/bin" && cd "$dir"
-          curl -fsSL -o logosctl.tar.gz https://github.com/logos-co/logos-logoscore-cli/releases/download/0.3.2/logosctl-x86_64-linux.tar.gz
-          echo "294fbcc6409a8851b7471582bdad2dbfaf681b5d1c67dfffec38ada925dc6762  logosctl.tar.gz" | sha256sum -c -
-          tar xzf logosctl.tar.gz && ./logosctl-x86_64.AppImage --appimage-extract >/dev/null
-          printf '#!/bin/sh\nexec "%s/squashfs-root/AppRun" "$@"\n' "$dir" > bin/logosctl && chmod +x bin/logosctl
-          echo "$dir/bin" >> "$GITHUB_PATH"
       - run: scripts/fetch_escrow.sh
-      # Starts the devnet from logos-devnet.toml: the escrow and a logosctl session per side.
-      - uses: drptbl/logos-devnet@v0.3.5
+      # Installs logosctl for the sessions, then starts the devnet from logos-devnet.toml:
+      # the escrow and a logosctl session per side.
+      - uses: drptbl/logos-devnet@v0.3.6
       - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
       # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
       - if: always()
