@@ -104,6 +104,9 @@ pub struct AgentServer {
     quoting: Arc<tokio::sync::Mutex<()>>,
     /// Held while offers are advertised or stopped, so they don't cross.
     advertising: Arc<tokio::sync::Mutex<()>>,
+    /// Held while offers are applied from a file or the Basecamp app, so an
+    /// older set never lands after a newer one.
+    applying: Arc<tokio::sync::Mutex<()>>,
     /// Set once the follow-through runs: one loop for a server and its clones.
     following: Arc<std::sync::OnceLock<()>>,
     tool_router: ToolRouter<Self>,
@@ -117,6 +120,7 @@ impl AgentServer {
             quoting: Arc::default(),
             advertising: Arc::default(),
             following: Arc::default(),
+            applying: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }

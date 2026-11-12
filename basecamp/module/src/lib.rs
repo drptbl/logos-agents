@@ -136,6 +136,9 @@ static AGENTS: std::sync::OnceLock<(AgentServer, tokio::runtime::Handle)> =
 static OFFERS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// Bumped each time the app sets offers, so an older retry gives way.
 static OFFERS_SET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Held while the app's offers are saved and applied: one save at a time,
+/// since the file is written through one temporary name.
+static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// What became of each offer the last time they were applied, by service id.
 static OFFERS_APPLIED: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 const OFFERS_FILE: &str = "offers.toml";
@@ -253,12 +256,13 @@ fn saved_offers() -> Result<Vec<OfferSpec>, String> {
 
 /// Apply `offers` until every one is advertised, or the app sets others.
 async fn keep_offers(server: AgentServer, offers: Vec<OfferSpec>, set: u64) {
+    let current = || OFFERS_SET.load(std::sync::atomic::Ordering::SeqCst) == set;
     server
-        .keep_offers(&offers, |applied| {
+        .keep_offers(&offers, current, |applied| {
             if let Ok(mut last) = OFFERS_APPLIED.lock() {
                 *last = Some(applied.clone());
             }
-            OFFERS_SET.load(std::sync::atomic::Ordering::SeqCst) == set
+            current()
         })
         .await;
 }
@@ -419,6 +423,7 @@ impl LogosAgentsModule for ModuleImpl {
     fn set_offers(&self, offers: String) -> String {
         for_app(|_| {
             let offers = provider::offers_from_json(&offers)?;
+            let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
             let path = OFFERS_PATH.get().ok_or("the data folder was not opened")?;
             logos_mcp::guard::write_private(path, provider::render_offers(&offers).as_bytes())
                 .map_err(|e| format!("can't save {OFFERS_FILE}: {e}"))?;
@@ -426,7 +431,8 @@ impl LogosAgentsModule for ModuleImpl {
             let (server, runtime) = AGENTS.get().ok_or("the MCP server isn't running")?;
             // Applied once now, so the app sees the outcome; any that fail are
             // tried again in the background.
-            runtime.block_on(server.keep_offers(&offers, |applied| {
+            let current = || OFFERS_SET.load(std::sync::atomic::Ordering::SeqCst) == set;
+            runtime.block_on(server.keep_offers(&offers, current, |applied| {
                 if let Ok(mut last) = OFFERS_APPLIED.lock() {
                     *last = Some(applied.clone());
                 }

@@ -37,15 +37,19 @@ async fn provide(file: PathBuf, args: Vec<OsString>) -> anyhow::Result<()> {
     let offering = server.clone();
     let advertising = tokio::spawn(async move {
         offering
-            .keep_offers(&offers, |applied| {
-                for (id, result) in applied.as_object().into_iter().flatten() {
-                    match result.get("error") {
-                        Some(e) => tracing::warn!("offer {id} not advertised yet: {e}"),
-                        None => tracing::info!("offer {id} advertised"),
+            .keep_offers(
+                &offers,
+                || true,
+                |applied| {
+                    for (id, result) in applied.as_object().into_iter().flatten() {
+                        match result.get("error") {
+                            Some(e) => tracing::warn!("offer {id} not advertised yet: {e}"),
+                            None => tracing::info!("offer {id} advertised"),
+                        }
                     }
-                }
-                true
-            })
+                    true
+                },
+            )
             .await;
     });
     stopped().await;

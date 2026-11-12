@@ -69,6 +69,9 @@ struct Offer {
     escrow_account: Option<String>,
     /// Set when the offer runs on its own: see `docs/providers.md`.
     auto: Option<Auto>,
+    /// Set from an offers file or the Basecamp app, which manage it, rather
+    /// than by the agent with `service_offer`.
+    from_spec: bool,
 }
 
 /// What runs an offer with no agent: its handler, and how many jobs it takes at once.
@@ -303,6 +306,9 @@ pub(super) struct Services {
     pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Jobs whose handler is running, one task per job: job -> service id.
     pub(super) running: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    /// The handlers of offers since stopped or replaced: their paid jobs
+    /// still get done.
+    retired: BTreeMap<String, Auto>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -1126,12 +1132,13 @@ impl AgentServer {
             *seen.entry(f.job.job.clone()).or_default() += 1;
         }
         let notes = self.with_payments().await.submitted.clone();
-        let (pending, settled, offers) = {
+        let (pending, settled, offers, retired) = {
             let state = self.services.lock().await;
             (
                 state.pending.clone(),
                 state.settled.clone(),
                 state.offers.clone(),
+                state.retired.clone(),
             )
         };
         // What each offer has taken: quotes still open, and handlers at work.
@@ -1168,9 +1175,15 @@ impl AgentServer {
                 continue;
             }
             // An offer that runs on its own quotes requests and works paid jobs itself.
+            // A paid job keeps the handler of an offer stopped or replaced since.
             let auto = offers
                 .get(&found.job.service)
                 .and_then(|o| o.auto.clone())
+                .or_else(|| {
+                    (found.job.state == State::Paid)
+                        .then(|| retired.get(&found.job.service).cloned())
+                        .flatten()
+                })
                 .filter(|_| found.job.role == Role::Provider);
             let provided = match &auto {
                 Some(auto) => self.provide(&found, auto, &mut taken).await,
@@ -1570,7 +1583,7 @@ impl AgentServer {
         &self,
         Parameters(p): Parameters<OfferParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.offer(p, None).await {
+        match self.offer(p, None, false).await {
             Ok(v) => ok(v),
             Err(e) => fail(e),
         }
@@ -1591,19 +1604,27 @@ impl AgentServer {
             handler,
             max_jobs: spec.max_jobs,
         });
-        self.offer(p, auto).await
+        self.offer(p, auto, true).await
     }
 
     /// Apply `offers`, trying again every `OFFERS_RETRY` while any fails to
-    /// advertise, as chat or discovery may not be up yet. `applied` hears what
+    /// advertise, as chat or discovery may not be up yet. Each try first asks
+    /// `wanted` whether these are still the offers to run. `applied` hears what
     /// became of each, by service id, after every try, and returns false to stop.
     pub async fn keep_offers(
         &self,
         offers: &[crate::provider::OfferSpec],
+        wanted: impl Fn() -> bool,
         mut applied: impl FnMut(&Value) -> bool,
     ) {
         loop {
+            // One set at a time, and only while it's still the one wanted.
+            let held = self.applying.lock().await;
+            if !wanted() {
+                return;
+            }
             let results = self.apply_offers(offers).await;
+            drop(held);
             let failed = results
                 .as_object()
                 .is_some_and(|all| all.values().any(|r| r.get("error").is_some()));
@@ -1617,7 +1638,16 @@ impl AgentServer {
     /// Make this server's offers match `wanted`: stop the ones no longer
     /// there and advertise the rest. Says what happened to each, by service id.
     pub async fn apply_offers(&self, wanted: &[crate::provider::OfferSpec]) -> Value {
-        let current: Vec<String> = self.services.lock().await.offers.keys().cloned().collect();
+        // Only the offers a file or the app set: the agent's own stay as they are.
+        let current: Vec<String> = self
+            .services
+            .lock()
+            .await
+            .offers
+            .iter()
+            .filter(|(_, o)| o.from_spec)
+            .map(|(id, _)| id.clone())
+            .collect();
         let mut results = serde_json::Map::new();
         for id in current
             .into_iter()
@@ -1645,7 +1675,12 @@ impl AgentServer {
         Value::Object(results)
     }
 
-    async fn offer(&self, p: OfferParams, auto: Option<Auto>) -> Result<Value, String> {
+    async fn offer(
+        &self,
+        p: OfferParams,
+        auto: Option<Auto>,
+        from_spec: bool,
+    ) -> Result<Value, String> {
         self.needs(&["chat", "discovery", "wallet"])?;
         // Another server running this wallet's services would get the requests.
         if let Err(e) = self.hold_wallet().await {
@@ -1703,6 +1738,17 @@ impl AgentServer {
         {
             let mut state = self.services.lock().await;
             state.advertised.insert(p.service_id.clone());
+            // A replaced handler keeps working its paid jobs; a revived one is live again.
+            let replaced = state.offers.get(&p.service_id).and_then(|o| o.auto.clone());
+            match (&auto, replaced) {
+                (Some(_), _) => {
+                    state.retired.remove(&p.service_id);
+                }
+                (None, Some(old)) => {
+                    state.retired.insert(p.service_id.clone(), old);
+                }
+                (None, None) => {}
+            }
             state.offers.insert(
                 p.service_id.clone(),
                 Offer {
@@ -1711,7 +1757,8 @@ impl AgentServer {
                     deliver_within_s,
                     advertised_to: address.clone(),
                     escrow_account: escrow_account.clone(),
-                    auto,
+                    auto: auto.clone(),
+                    from_spec,
                 },
             );
         }
@@ -1783,7 +1830,13 @@ impl AgentServer {
             return fail(e);
         }
         let _advertising = self.advertising.lock().await;
-        self.services.lock().await.offers.remove(&p.service_id);
+        {
+            // A stopped offer's paid jobs still get done.
+            let mut state = self.services.lock().await;
+            if let Some(auto) = state.offers.remove(&p.service_id).and_then(|o| o.auto) {
+                state.retired.insert(p.service_id.clone(), auto);
+            }
+        }
         match self
             .base
             .node()

@@ -4486,10 +4486,14 @@ async fn offers_that_fail_to_advertise_are_tried_again() {
     );
     let (s, _dir) = services_server(fake.clone());
     let mut tries = Vec::new();
-    s.keep_offers(&[spec(None, 1)], |applied| {
-        tries.push(applied.clone());
-        true
-    })
+    s.keep_offers(
+        &[spec(None, 1)],
+        || true,
+        |applied| {
+            tries.push(applied.clone());
+            true
+        },
+    )
     .await;
     assert_eq!(tries.len(), 2, "{tries:?}");
     assert!(tries[0][SVC].get("error").is_some(), "{tries:?}");
@@ -4557,6 +4561,54 @@ async fn a_paid_job_waits_while_the_offers_handlers_are_busy() {
     assert!(seen.lock().unwrap().is_empty());
     assert!(
         fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn applying_offers_leaves_the_agents_own_alone() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    s.service_offer(offer()).await.unwrap();
+    let mut other = spec(None, 1);
+    other.service_id = "demo/translate/v1".into();
+    let applied = s.apply_offers(&[other]).await;
+    assert!(applied.get(SVC).is_none(), "{applied}");
+    let stopped = fake.calls_to("libp2p_module.discoStopAdvertising");
+    assert!(
+        !stopped.iter().any(|c| c.iter().any(|a| a.contains(SVC))),
+        "{stopped:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_removed_offer_still_works_its_paid_jobs() {
+    let (url, seen) = handler(vec![("200 OK", r#"{"output": {"text": "done"}}"#)]);
+    let (s, fake, _dir) = paid_job_for(&url, FAR + 600_000).await;
+    s.apply_offers(&[]).await;
+    s.follow_through().await;
+    let sends = calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    assert_eq!(instruction(&sends[0])[0], 1, "a Deliver");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn offers_no_longer_wanted_are_not_applied() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    let mut heard = 0;
+    s.keep_offers(
+        &[spec(None, 1)],
+        || false,
+        |_| {
+            heard += 1;
+            true
+        },
+    )
+    .await;
+    assert_eq!(heard, 0);
+    assert!(
+        fake.calls_to("libp2p_module.discoStartAdvertising")
             .is_empty()
     );
 }
