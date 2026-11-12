@@ -4266,6 +4266,7 @@ fn spec(handler: Option<&str>, max_jobs: u32) -> crate::provider::OfferSpec {
         escrow_account: None,
         handler: handler.map(str::to_string),
         max_jobs,
+        remote_handler: false,
     }
 }
 

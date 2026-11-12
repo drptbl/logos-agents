@@ -184,3 +184,27 @@ fn an_answer_without_an_output_declines() {
         Answer::Declined(_)
     ));
 }
+
+#[test]
+fn offers_from_the_app_pass_the_same_checks_and_round_trip() {
+    let json = r#"[
+        {"service_id": "acme/summarize/v1", "tag": "summarize", "price_lepta": "1000000",
+         "deliver_within_s": 3600, "handler": "http://127.0.0.1:8080/summarize", "max_jobs": 2},
+        {"service_id": "acme/manual/v1", "tag": "by hand", "price_lepta": "5"}
+    ]"#;
+    let offers = offers_from_json(json).unwrap();
+    assert_eq!(offers, parse_offers(OFFERS).unwrap());
+    // Saved as an offers file, they read back the same.
+    assert_eq!(parse_offers(&render_offers(&offers)).unwrap(), offers);
+    // And shown to the app as they came.
+    let shown = offers_to_json(&offers);
+    assert_eq!(offers_from_json(&shown.to_string()).unwrap(), offers);
+    // The app's offers meet the file's rules.
+    let remote = r#"[{"service_id": "a/b/v1", "tag": "t", "price_lepta": "1",
+                      "handler": "https://jobs.example.com/run"}]"#;
+    assert!(
+        offers_from_json(remote)
+            .unwrap_err()
+            .contains("remote_handler")
+    );
+}

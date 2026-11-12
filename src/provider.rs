@@ -27,6 +27,8 @@ pub struct OfferSpec {
     pub handler: Option<String>,
     /// Jobs taken at once, quoted or paid and not yet delivered.
     pub max_jobs: u32,
+    /// Whether the handler may be on another machine.
+    pub remote_handler: bool,
 }
 
 #[derive(Deserialize)]
@@ -36,27 +38,71 @@ struct OffersFile {
     offer: Vec<RawOffer>,
 }
 
-#[derive(Deserialize)]
+/// An offer as a file or the app writes it, before its checks.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawOffer {
     service_id: String,
     tag: String,
     price_lepta: String,
     deliver_within_s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     escrow_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     handler: Option<String>,
     max_jobs: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     remote_handler: bool,
 }
 
-/// The offers in an offers file. One broken offer refuses the whole file, so
-/// a typo never quietly drops an offer.
+impl From<&OfferSpec> for RawOffer {
+    fn from(o: &OfferSpec) -> Self {
+        Self {
+            service_id: o.service_id.clone(),
+            tag: o.tag.clone(),
+            price_lepta: o.price_lepta.clone(),
+            deliver_within_s: Some(o.deliver_within_s),
+            escrow_account: o.escrow_account.clone(),
+            handler: o.handler.clone(),
+            max_jobs: Some(o.max_jobs),
+            remote_handler: o.remote_handler,
+        }
+    }
+}
+
+/// The offers in an offers file.
 pub fn parse_offers(text: &str) -> Result<Vec<OfferSpec>, String> {
     let file: OffersFile = toml::from_str(text).map_err(|e| e.to_string())?;
+    checked(file.offer)
+}
+
+/// The offers the Basecamp app sends, a JSON list, under the same checks as a file's.
+pub fn offers_from_json(text: &str) -> Result<Vec<OfferSpec>, String> {
+    let raw: Vec<RawOffer> = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    checked(raw)
+}
+
+/// The offers as the app shows them.
+pub fn offers_to_json(offers: &[OfferSpec]) -> serde_json::Value {
+    serde_json::to_value(offers.iter().map(RawOffer::from).collect::<Vec<_>>()).unwrap_or_default()
+}
+
+/// The offers as an offers file.
+pub fn render_offers(offers: &[OfferSpec]) -> String {
+    #[derive(Serialize)]
+    struct File {
+        offer: Vec<RawOffer>,
+    }
+    toml::to_string(&File {
+        offer: offers.iter().map(RawOffer::from).collect(),
+    })
+    .unwrap_or_default()
+}
+
+/// One broken offer refuses them all, so a typo never quietly drops an offer.
+fn checked(raw: Vec<RawOffer>) -> Result<Vec<OfferSpec>, String> {
     let mut seen = BTreeSet::new();
-    file.offer
-        .into_iter()
+    raw.into_iter()
         .map(|raw| {
             if !seen.insert(raw.service_id.clone()) {
                 return Err(format!("{} is offered twice", raw.service_id));
@@ -76,6 +122,7 @@ pub fn parse_offers(text: &str) -> Result<Vec<OfferSpec>, String> {
                 escrow_account: raw.escrow_account,
                 handler: raw.handler,
                 max_jobs: raw.max_jobs.unwrap_or(1),
+                remote_handler: raw.remote_handler,
             })
         })
         .collect()
