@@ -29,6 +29,9 @@ const OFFERS_RETRY: std::time::Duration = if cfg!(test) {
 } else {
     std::time::Duration::from_secs(30)
 };
+/// The time a handler leaves for its answer to be delivered, on top of the
+/// deadline's margin.
+const DELIVER_SLACK_MS: u64 = 60 * 1000;
 /// The reason a full offer gives the buyer.
 const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Room kept in a chat message for the protocol fields around a text input or output.
@@ -539,6 +542,14 @@ pub struct CancelParams {
 /// timestamps that lag. An escrow opened now would leave no time either.
 pub(super) fn too_late_for(deadline: u64) -> bool {
     now_ms().saturating_add(DEADLINE_MARGIN_MS) >= deadline
+}
+
+/// How long a handler may take for a job due at `deadline`: up to the
+/// deadline's margin, less the time its answer needs to be delivered.
+fn handler_time_left(deadline: u64) -> u64 {
+    deadline
+        .saturating_sub(DEADLINE_MARGIN_MS + DELIVER_SLACK_MS)
+        .saturating_sub(now_ms())
 }
 
 fn now_ms() -> u64 {
@@ -1317,9 +1328,7 @@ impl AgentServer {
             if let Some(output) = &kept {
                 break Answer::Output(output.clone());
             }
-            let left = deadline
-                .saturating_sub(DEADLINE_MARGIN_MS)
-                .saturating_sub(now_ms());
+            let left = handler_time_left(deadline);
             if left < 1000 {
                 break Answer::Declined("the handler didn't finish in time".into());
             }
@@ -1348,9 +1357,7 @@ impl AgentServer {
             match answer {
                 Answer::Retry(e) => {
                     tracing::warn!(job = %job.job, "handler failed for now: {e}");
-                    let left = deadline
-                        .saturating_sub(DEADLINE_MARGIN_MS)
-                        .saturating_sub(now_ms());
+                    let left = handler_time_left(deadline);
                     if u128::from(left) < wait.as_millis() + 1000 {
                         break Answer::Declined("the handler didn't finish in time".into());
                     }
@@ -1360,6 +1367,17 @@ impl AgentServer {
                 other => break other,
             }
         };
+        // The user may have switched the tools off while the handler worked:
+        // act on nothing now, and keep an output for when they're back on.
+        if !self.follows_through() {
+            if let Answer::Output(output) = &answer
+                && let Err(e) = self.save_result(&job.job, Some(output)).await
+            {
+                tracing::warn!(job = %job.job, "can't keep the handler's output: {e}");
+            }
+            tracing::info!(job = %job.job, "provider: services are off, the job waits");
+            return;
+        }
         let (tool, result) = match answer {
             Answer::Output(output) => {
                 let (output_text, output_cid) = match output {

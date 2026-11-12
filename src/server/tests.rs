@@ -4211,6 +4211,14 @@ async fn a_second_server_on_a_wallet_does_not_advertise() {
 /// A handler on this machine that answers each request with the next of
 /// `answers`, keeping the requests' bodies.
 fn handler(answers: Vec<(&'static str, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    handler_gated(answers, None)
+}
+
+/// `handler`, holding each answer until `gate` lets it go.
+fn handler_gated(
+    answers: Vec<(&'static str, &'static str)>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/run", listener.local_addr().unwrap());
@@ -4246,6 +4254,9 @@ fn handler(answers: Vec<(&'static str, &'static str)>) -> (String, Arc<Mutex<Vec
                 if n == 0 {
                     break;
                 }
+            }
+            if let Some(gate) = &gate {
+                let _ = gate.recv();
             }
             let reply = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -4611,4 +4622,33 @@ async fn offers_no_longer_wanted_are_not_applied() {
         fake.calls_to("libp2p_module.discoStartAdvertising")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_handler_finishing_after_services_went_off_keeps_its_output_for_later() {
+    let (open, gate) = std::sync::mpsc::channel();
+    let (url, seen) = handler_gated(
+        vec![("200 OK", r#"{"output": {"text": "done"}}"#)],
+        Some(gate),
+    );
+    let (s, fake, dir) = paid_job_for(&url, FAR + 600_000).await;
+    let (groups, rx) = tokio::sync::watch::channel(ToolGroups::default());
+    let s = s.with_tool_groups(rx);
+    s.follow_through().await;
+    for _ in 0..200 {
+        if !seen.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // The user turns services off while the handler works.
+    groups.send_modify(|g| g.set("services", false).unwrap());
+    open.send(()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    let kept = std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
+    assert!(kept.contains("\"done\""), "{kept}");
 }
