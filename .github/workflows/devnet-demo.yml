@@ -38,7 +38,7 @@ jobs:
       - run: cargo build --locked
       # Installs logosctl for the sessions, then starts the devnet from logos-devnet.toml:
       # the escrow and a logosctl session per side.
-      - uses: drptbl/logos-devnet@v0.5.0
+      - uses: drptbl/logos-devnet@v0.6.1
       - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
       # A provider that runs on its own: logos-agents provide, with a handler here.
       - run: python3 scripts/demo_provider.py --timeout 600
