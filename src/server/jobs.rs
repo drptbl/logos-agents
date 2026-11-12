@@ -34,6 +34,14 @@ const OFFERS_RETRY: std::time::Duration = if cfg!(test) {
 const DELIVER_SLACK_MS: u64 = 60 * 1000;
 /// How long a quote handler has to price a request: it holds up the pass.
 const QUOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a request waits for an answer before it's sent again: after the
+/// first try, then after the second. Chat can lose a message, with no receipt.
+const ASK_AGAIN_AFTER_MS: [u64; 2] = [60 * 1000, 5 * 60 * 1000];
+/// How long the last try waits before the job is canceled.
+const GIVE_UP_AFTER_MS: u64 = 10 * 60 * 1000;
+/// How long asking again lasts from the first try, with room for slow passes.
+/// An older request with no answer is canceled without asking again.
+const ASKING_LASTS_MS: u64 = 30 * 60 * 1000;
 /// The reason a full offer gives the buyer.
 const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Where a server keeps its handlers' storage files, under the files root.
@@ -54,7 +62,7 @@ const PAYMENTS: &str = "service-payments.json";
 const RESULTS: &str = "service-results.json";
 
 /// What the follow-through does, for the agent.
-const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, and only quotes, works or declines jobs for an offer with a handler, which runs on its own. Calling the step a job's next names does it sooner.";
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain or a reply, by default once a minute: it asks a provider again when a request gets no answer and cancels it after three tries, tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, and only quotes, works or declines jobs for an offer with a handler, which runs on its own. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// Held by the one server running this wallet's services.
@@ -831,11 +839,16 @@ impl AgentServer {
     }
 
     async fn send_message(&self, convo: &str, m: &protocol::Message) -> Result<(), String> {
+        self.send_text(convo, &protocol::encode(m)).await
+    }
+
+    /// Send a message's text as it is.
+    async fn send_text(&self, convo: &str, text: &str) -> Result<(), String> {
         tool_json(
             self.base
                 .chat_send(Parameters(ChatSendParams {
                     conversation_id: convo.to_string(),
-                    text: protocol::encode(m),
+                    text: text.to_string(),
                 }))
                 .await,
         )
@@ -1221,8 +1234,9 @@ impl AgentServer {
     }
 
     /// One pass over every job, taking the steps that only waited on the
-    /// chain: telling the provider once a payment lands, sending a recorded
-    /// result, claiming and refunding. It never pays, and only quotes, works
+    /// chain or a reply: asking again for a request with no answer, telling the
+    /// provider once a payment lands, sending a recorded result, claiming and
+    /// refunding. It never pays, and only quotes, works
     /// or declines jobs for an offer with a handler. Returns what it did, as
     /// `tool job` lines.
     pub(super) async fn follow_through(&self) -> Vec<String> {
@@ -1743,7 +1757,48 @@ impl AgentServer {
         self.base.allows("service_jobs") && self.needs(&["chat", "wallet"]).is_ok()
     }
 
-    /// The follow-through's step for one job, if the chain has made one due.
+    /// A request still unanswered: send it again, unchanged, once it has waited
+    /// long enough, and cancel the job once its last try has.
+    async fn ask_again(
+        &self,
+        convo: &str,
+        job: &Job,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        // Without its times, a request can't be timed: leave it.
+        if job.asked_ms == 0 || job.updated_ms == 0 {
+            return Ok(None);
+        }
+        let now = now_ms();
+        let waited = now.saturating_sub(job.asked_ms);
+        let tries = usize::try_from(job.asks).unwrap_or(usize::MAX);
+        // A request long past every try, as after an upgrade, isn't sent again.
+        let stale = now.saturating_sub(job.updated_ms) > ASKING_LASTS_MS;
+        match ASK_AGAIN_AFTER_MS.get(tries.saturating_sub(1)) {
+            Some(&wait) if waited >= wait && !stale => {
+                self.send_text(convo, &job.request).await?;
+                Ok(Some((
+                    "service_request",
+                    json!({ "job": job.job, "asked": job.asks + 1 }),
+                )))
+            }
+            next if stale || (next.is_none() && waited >= GIVE_UP_AFTER_MS) => {
+                // A quote may have come since this pass read the job.
+                let (_, now_seen) = self.find_job(&job.job, Role::Buyer).await?;
+                if now_seen.state != State::Requested {
+                    return Ok(None);
+                }
+                let p = CancelParams {
+                    job: job.job.clone(),
+                    reason: Some("no answer came to the request".into()),
+                };
+                Ok(Some(("service_cancel", self.cancel(p).await?)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The follow-through's step for one job, if the chain, or a reply that
+    /// never came, has made one due.
     async fn follow_through_job(
         &self,
         found: &Found,
@@ -1756,6 +1811,10 @@ impl AgentServer {
             job,
         } = found;
         let id = job.job.as_str();
+        // A request no answer came to: chat may have lost it.
+        if (job.role, job.state) == (Role::Buyer, State::Requested) && *can_send {
+            return self.one_at_a_time(id, self.ask_again(convo, job)).await;
+        }
         // A payment under way: tell the provider once it has landed. An
         // escrow payment is noted with its account before it is asked for; a
         // transfer needs none.
@@ -2268,7 +2327,11 @@ impl AgentServer {
             "job": job,
             "conversation_id": convo,
             "service_id": p.service_id,
-            "note": "sent; the quote shows up in service_jobs. If none comes, ask again: there is no delivery receipt",
+            "note": if self.follows_through() {
+                "sent; the quote shows up in service_jobs. Chat has no delivery receipt: this server asks again when no answer comes, and cancels the job after three tries"
+            } else {
+                "sent; the quote shows up in service_jobs. Chat has no delivery receipt: if none comes, ask again"
+            },
         }))
     }
 
