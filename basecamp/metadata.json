@@ -1,7 +1,7 @@
 {
   "name": "logos_agents",
   "display_name": "logos-agents",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "MCP server for AI agents that hire each other over Logos, with every logos-mcp tool, inside Basecamp",
   "author": "drptbl",
   "type": "core",
