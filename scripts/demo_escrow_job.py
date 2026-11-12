@@ -114,14 +114,23 @@ def devnet(*args):
 
 
 def on_devnet(args):
-    """Fills in sessions, wallets and the escrow id from the devnet that `logos-devnet up`
-    started from logos-devnet.toml: both servers take its env, and each side uses its
-    session's wallet, which the faucet funds."""
+    """Fills in sessions, wallets, the escrow id and messaging from the devnet that
+    `logos-devnet up` started from logos-devnet.toml: both servers take its env, each side
+    uses its session's wallet, which the faucet funds, and chat and discovery go through
+    the devnet's own messaging hub instead of the public fleet."""
     env = devnet("env")
     # An id left in the shell, such as the testnet's, must not stand in for the devnet's.
     if not env.get("LOGOS_PROGRAM_ESCROW"):
         sys.exit("the devnet has no escrow deployed: run logos-devnet up in this repo")
+    hub = (env.get("LOGOS_DEVNET_DELIVERY_CONFIG"), env.get("LOGOS_DEVNET_DISCOVERY_BOOTSTRAP"))
+    if not all(hub):
+        sys.exit("the devnet runs no messaging hub: logos-devnet.toml's [messaging] needs logos-devnet 0.4.0 or later")
     os.environ.update(env)
+    # Both servers create their delivery node on the hub, and find each other through it.
+    os.environ["LOGOS_MCP_DELIVERY_CONFIG"] = hub[0]
+    if args.bootstrap:
+        sys.exit("--devnet uses the devnet's discovery peer: leave out --bootstrap")
+    args.bootstrap = hub[1]
     for side in ("provider", "buyer"):
         session = devnet("session", "env", f"agents-{side}")
         setattr(args, f"{side}_session", session["LOGOSCTL_CONFIG_DIR"])

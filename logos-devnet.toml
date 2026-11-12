@@ -12,3 +12,7 @@ modules = ["chat_module", "libp2p_module"]
 
 [sessions.agents-buyer]
 modules = ["chat_module", "libp2p_module"]
+
+# A local delivery node and discovery bootstrap, so chat and discovery stay off the
+# public fleet.
+[messaging]
