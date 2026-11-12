@@ -78,17 +78,36 @@ void LogosAgentsAppBackend::refreshWallet()
     setWallet(checked(modules().logos_agents.wallet()));
 }
 
+QString LogosAgentsAppBackend::saveOffers(QString offers)
+{
+    const QString reply = checked(modules().logos_agents.set_offers(offers));
+    if (!isError(reply))
+        setOffers(reply);
+    return reply;
+}
+
+void LogosAgentsAppBackend::refreshOffers()
+{
+    const QString reply = checked(modules().logos_agents.offers());
+    if (!isError(reply))
+        setOffers(reply);
+}
+
 void LogosAgentsAppBackend::onContextReady()
 {
     QObject::connect(&m_poll, &QTimer::timeout, [this]() { refresh(); });
     m_poll.start(kPollMs);
-    QObject::connect(&m_walletPoll, &QTimer::timeout, [this]() { refreshWallet(); });
+    QObject::connect(&m_walletPoll, &QTimer::timeout, [this]() {
+        refreshWallet();
+        refreshOffers();
+    });
     m_walletPoll.start(kWalletPollMs);
     // Not from inside the hook: on Basecamp 0.4.0-rc.2 calls made this early are
     // refused because the backend's token isn't registered yet.
     QTimer::singleShot(kFirstPollMs, [this]() {
         refresh();
         refreshWallet();
+        refreshOffers();
     });
 }
 

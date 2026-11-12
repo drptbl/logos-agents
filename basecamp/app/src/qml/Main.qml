@@ -18,6 +18,31 @@ Item {
     readonly property var activity: parse(backend ? backend.activity : "[]", [])
     readonly property var wallet: parse(backend ? backend.wallet : "{}", {})
     readonly property var approvals: parse(backend ? backend.approvals : "{}", {})
+    readonly property var offersState: parse(backend ? backend.offers : "{}", {})
+    // The offers being edited. Taken from the module until the user changes one.
+    property var offerDraft: []
+    property bool offersEdited: false
+    onOffersStateChanged: if (!offersEdited) offerDraft = (offersState.offers || []).slice()
+
+    function setOffer(index, key, value) {
+        const next = offerDraft.slice()
+        next[index] = Object.assign({}, next[index])
+        if (value === "" || value === null) delete next[index][key]
+        else next[index][key] = value
+        offerDraft = next
+        offersEdited = true
+    }
+
+    function saveOffers() {
+        const reply = parse(backend.saveOffers(JSON.stringify(offerDraft)), {})
+        if (reply.error) {
+            notice = reply.error
+            return
+        }
+        offersEdited = false
+        offerDraft = (reply.offers || []).slice()
+        notice = qsTr("Offers saved")
+    }
     // The account waiting for the user to confirm handing it over.
     property var handOver: null
 
@@ -139,6 +164,7 @@ Item {
             TabButton { text: qsTr("Connect") }
             TabButton { text: qsTr("Permissions") }
             TabButton { text: qsTr("Wallet") }
+            TabButton { text: qsTr("Offers") }
             TabButton { text: qsTr("Activity") }
         }
 
@@ -421,6 +447,139 @@ Item {
                                     })
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // ---- Offers --------------------------------------------------
+            ColumnLayout {
+                spacing: Theme.spacing.medium
+
+                LogosText {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: Theme.palette.textSecondary
+                    text: qsTr("Services this agent offers. An offer with a handler runs on its own: requests are quoted at its price, paid jobs go to the handler's URL, and its answer is delivered. Without a handler, your agent answers the requests.")
+                }
+
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: Theme.spacing.medium
+                    model: root.offerDraft
+                    delegate: ColumnLayout {
+                        required property var modelData
+                        required property int index
+                        width: ListView.view.width
+                        spacing: Theme.spacing.small
+                        readonly property var applied: (root.offersState.applied || {})[modelData.service_id] || null
+
+                        RowLayout {
+                            LogosText {
+                                Layout.fillWidth: true
+                                font.weight: Theme.typography.weightMedium
+                                text: modelData.service_id || qsTr("New offer")
+                            }
+                            LogosText {
+                                visible: !root.offersEdited && applied !== null
+                                color: applied && applied.error ? Theme.palette.error : Theme.palette.success
+                                text: applied && applied.error ? applied.error : qsTr("advertised")
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: 360
+                            }
+                            LogosButton {
+                                text: qsTr("Remove")
+                                onClicked: {
+                                    const next = root.offerDraft.slice()
+                                    next.splice(index, 1)
+                                    root.offerDraft = next
+                                    root.offersEdited = true
+                                }
+                            }
+                        }
+
+                        GridLayout {
+                            Layout.fillWidth: true
+                            columns: 2
+                            columnSpacing: Theme.spacing.medium
+
+                            LogosText { text: qsTr("Service id") }
+                            TextField {
+                                Layout.fillWidth: true
+                                placeholderText: "my-app/summarize/v1"
+                                text: modelData.service_id || ""
+                                onEditingFinished: if (text !== (modelData.service_id || "")) root.setOffer(index, "service_id", text)
+                            }
+                            LogosText { text: qsTr("Tag") }
+                            TextField {
+                                Layout.fillWidth: true
+                                placeholderText: qsTr("what buyers see, at most 33 bytes")
+                                text: modelData.tag || ""
+                                onEditingFinished: if (text !== (modelData.tag || "")) root.setOffer(index, "tag", text)
+                            }
+                            LogosText { text: qsTr("Price (lepta)") }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                TextField {
+                                    Layout.fillWidth: true
+                                    validator: RegularExpressionValidator { regularExpression: /[0-9]*/ }
+                                    text: modelData.price_lepta || ""
+                                    onEditingFinished: if (text !== (modelData.price_lepta || "")) root.setOffer(index, "price_lepta", text)
+                                }
+                                LogosText { text: modelData.price_lepta ? root.lez(modelData.price_lepta) : ""; color: Theme.palette.textSecondary }
+                            }
+                            LogosText { text: qsTr("Deliver within (s)") }
+                            SpinBox {
+                                from: 1; to: 86400; editable: true
+                                value: modelData.deliver_within_s || 600
+                                onValueModified: root.setOffer(index, "deliver_within_s", value)
+                            }
+                            LogosText { text: qsTr("Handler URL") }
+                            TextField {
+                                Layout.fillWidth: true
+                                placeholderText: qsTr("http://127.0.0.1:8080/run, or empty for your agent")
+                                text: modelData.handler || ""
+                                onEditingFinished: if (text !== (modelData.handler || "")) root.setOffer(index, "handler", text)
+                            }
+                            LogosText { text: qsTr("Jobs at once") }
+                            SpinBox {
+                                from: 1; to: 100; editable: true
+                                enabled: !!modelData.handler
+                                value: modelData.max_jobs || 1
+                                onValueModified: root.setOffer(index, "max_jobs", value)
+                            }
+                            LogosText { text: "" }
+                            CheckBox {
+                                text: qsTr("The handler may be on another machine")
+                                enabled: !!modelData.handler
+                                checked: !!modelData.remote_handler
+                                onToggled: root.setOffer(index, "remote_handler", checked ? true : null)
+                            }
+                        }
+                    }
+                }
+
+                RowLayout {
+                    LogosButton {
+                        text: qsTr("Add offer")
+                        onClicked: {
+                            root.offerDraft = root.offerDraft.concat([{ deliver_within_s: 600, max_jobs: 1 }])
+                            root.offersEdited = true
+                        }
+                    }
+                    LogosButton {
+                        text: qsTr("Save")
+                        enabled: root.offersEdited
+                        onClicked: root.saveOffers()
+                    }
+                    LogosButton {
+                        text: qsTr("Discard changes")
+                        visible: root.offersEdited
+                        onClicked: {
+                            root.offersEdited = false
+                            root.offerDraft = (root.offersState.offers || []).slice()
                         }
                     }
                 }

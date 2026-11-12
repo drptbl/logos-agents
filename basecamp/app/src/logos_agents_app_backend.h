@@ -20,6 +20,8 @@ public:
     void refreshWallet() override;
     QString approve(QString requestId) override;
     QString deny(QString requestId) override;
+    QString saveOffers(QString offers) override;
+    void refreshOffers() override;
 
     void onContextReady() override;
 
