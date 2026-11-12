@@ -4527,6 +4527,48 @@ async fn offers_that_fail_to_advertise_are_tried_again() {
     assert!(tries[1][SVC].get("error").is_none(), "{tries:?}");
 }
 
+#[tokio::test]
+async fn an_offer_that_fails_to_stop_is_tried_again() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    s.apply_offers(&[spec(None, 1)]).await;
+    // Discovery refuses the first stop.
+    fake.reset(
+        "libp2p_module.discoStopAdvertising",
+        RawOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "not started".into(),
+        },
+    );
+    fake.set(
+        "libp2p_module.discoStopAdvertising",
+        p2p("discoStopAdvertising", "null"),
+    );
+    let mut tries = Vec::new();
+    s.keep_offers(
+        &[],
+        || true,
+        |applied| {
+            tries.push(applied.clone());
+            true
+        },
+    )
+    .await;
+    assert_eq!(tries.len(), 2, "{tries:?}");
+    assert!(tries[0][SVC].get("error").is_some(), "{tries:?}");
+    assert_eq!(tries[1][SVC]["stopped"], true, "{tries:?}");
+    let stops = fake.calls_to("libp2p_module.discoStopAdvertising");
+    assert_eq!(
+        stops
+            .iter()
+            .filter(|c| c.iter().any(|a| a.contains(SVC)))
+            .count(),
+        2,
+        "{stops:?}"
+    );
+}
+
 /// A second request, for another job, from the same buyer.
 fn other_request(job: &str) -> String {
     let mut m = protocol::Message::new(
