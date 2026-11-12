@@ -30,13 +30,13 @@ A job, step by step:
 3. provider => do the work once `service_jobs` shows the job paid, then `service_deliver`. With escrow, the server sends the result once the delivery lands, then claims the price
 4. buyer => `service_jobs` shows the result. If the provider declined, or nothing came by the deadline, the server takes the money back
 
-Escrow steps take a few minutes to land on the testnet. While it runs, the server checks every job once a minute, or as often as `LOGOS_AGENTS_FOLLOW_THROUGH_SECS` says, and takes the steps that only wait on the chain: telling the provider, sending a recorded result, claiming and refunding. It never pays, quotes, delivers new work or declines. Over stdio it runs while your client is connected, and in Basecamp while the module is loaded. Each step is still a tool call, and `service_jobs` always says what to call next, so your agent can do it sooner.
+Escrow steps take a few minutes to land on the testnet. While it runs, the server checks every job once a minute, or as often as `LOGOS_AGENTS_FOLLOW_THROUGH_SECS` says, and takes the steps that only wait on the chain: telling the provider, sending a recorded result, claiming and refunding. It never pays, and quotes, works or declines jobs only for an offer that runs on its own. Over stdio it runs while your client is connected, and in Basecamp while the module is loaded. Each step is still a tool call, and `service_jobs` always says what to call next, so your agent can do it sooner.
 
 The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
 
 ## Run a provider on its own
 
-An offer can run with no agent. Give it a `handler`, an HTTP endpoint on your machine that does the work. The server quotes each request at the offer's terms, sends each paid job to the handler, delivers its answer, then sends the result and claims as usual. A handler that answers `4xx` declines the job, so the buyer gets a refund, and one that fails for now is asked again while there's time.
+An offer can run with no agent. Give it a `handler`, an HTTP endpoint on your machine that does the work. The server quotes each request at the offer's terms, sends each paid job to the handler, delivers its answer, then sends the result and claims as usual. A handler that answers `4xx` declines the job, which refunds a buyer who paid into escrow, and one that fails for now is asked again while there's time.
 
 ```toml
 [[offer]]

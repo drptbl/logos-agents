@@ -61,7 +61,7 @@ Content-Type: application/json
 | Answer | What the server does |
 | --- | --- |
 | `200` with an output | records the delivery |
-| `4xx` | declines the job with the response body as the reason, so the buyer gets a refund at once |
+| `4xx` | declines the job with the response body as the reason. A buyer who paid into escrow gets a refund at once |
 | `5xx`, a timeout or no connection | tries again with backoff while there's time to deliver, then declines |
 | an output too big for a chat message | declines |
 
