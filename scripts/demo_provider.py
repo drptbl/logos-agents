@@ -2,8 +2,9 @@
 """A provider that runs on its own, on the local devnet logos-devnet.toml sets up.
 
 `logos-agents provide` serves one offer whose handler is a small HTTP server
-started here, with no agent on the provider's side. A buyer agent finds it,
-asks for two jobs and pays for each into escrow:
+started here, with no agent on the provider's side. The same server prices
+each request by its word count, as the offer's quote handler. A buyer agent
+finds it, asks for two jobs and pays for each into escrow:
 
 1. the handler answers the first, and the buyer gets that output, then the
    provider's server claims the price
@@ -27,17 +28,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import demo_escrow_job as demo  # noqa: E402
 
 DECLINE = "please decline this one"
+# What the quote handler charges per word of input.
+PER_WORD = 50_000
+
+
+def price_of(text):
+    return str(max(1, len(text.split())) * PER_WORD)
 
 
 def serve_handler():
-    """A handler on this machine: it summarises a text, and declines DECLINE."""
+    """A handler on this machine: it summarises a text, declines DECLINE, and on
+    /quote prices a request by its word count."""
     asked = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             job = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            asked.append(job)
             text = job["input"].get("text", "")
+            if self.path == "/quote":
+                body = json.dumps({"price_lepta": price_of(text)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            asked.append(job)
             if text == DECLINE:
                 status, body = 422, b"this handler won't do that one"
             else:
@@ -53,7 +68,7 @@ def serve_handler():
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{server.server_port}/run", asked
+    return f"http://127.0.0.1:{server.server_port}", asked
 
 
 def main():
@@ -71,12 +86,14 @@ def main():
                                buyer_wallet=None, buyer_from=None, bootstrap=None)
     demo.on_devnet(sides)
 
-    url, asked = serve_handler()
+    base, asked = serve_handler()
+    url = f"{base}/run"
     logs = tempfile.mkdtemp(prefix="logos-mcp-demo-")
     offers = os.path.join(logs, "offers.toml")
     with open(offers, "w") as f:
         f.write(f'[[offer]]\nservice_id = "{args.service}"\ntag = "summarize"\n'
-                f'price_lepta = "{args.price}"\ndeliver_within_s = 3600\nhandler = "{url}"\nmax_jobs = 2\n')
+                f'price_lepta = "{args.price}"\ndeliver_within_s = 3600\nhandler = "{url}"\n'
+                f'quote_handler = "{base}/quote"\nmax_jobs = 2\n')
 
     wallet = sides.provider_wallet
     provider_env = dict(
@@ -105,7 +122,10 @@ def main():
             job = demo.call(buyer, "buyer", "service_request", chat_address=found["chat_address"],
                             service_id=args.service, input_text=text)["job"]
             demo.wait_for(lambda: demo.state(buyer, job) == "quoted", "the provider's quote", args.timeout)
-            demo.log("[provider] quoted on its own")
+            price = demo.job_in(buyer, job)["quote"]["price_lepta"]
+            if price != price_of(text):
+                sys.exit(f"quoted {price} lepta, not the quote handler's {price_of(text)}")
+            demo.log(f"[provider] quoted {price} lepta on its own, by the word")
             demo.call(buyer, "buyer", "service_pay", job=job, **{"from": sides.buyer_from})
             return job
 
