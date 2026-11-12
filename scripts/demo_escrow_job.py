@@ -120,7 +120,7 @@ def on_devnet(args):
     env = devnet("env")
     # An id left in the shell, such as the testnet's, must not stand in for the devnet's.
     if not env.get("LOGOS_PROGRAM_ESCROW"):
-        sys.exit("the devnet has no escrow deployed: run scripts/fetch_escrow.sh, then logos-devnet up")
+        sys.exit("the devnet has no escrow deployed: run logos-devnet up in this repo")
     os.environ.update(env)
     for side in ("provider", "buyer"):
         session = devnet("session", "env", f"agents-{side}")

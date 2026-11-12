@@ -110,7 +110,6 @@ A run with `--decline` took about 11 minutes on `logos.dev`.
 On a local chain it took under a minute and needs no faucet. [logos-devnet](https://github.com/drptbl/logos-devnet) runs one, and `logos-devnet.toml` sets it up for this repo: the escrow program, from a [logos-escrow](https://github.com/drptbl/logos-escrow) release, and a `logosctl` session for each side:
 
 ```bash
-scripts/fetch_escrow.sh
 logos-devnet up
 python3 scripts/demo_escrow_job.py --devnet --decline --poll 3
 ```

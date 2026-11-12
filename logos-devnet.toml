@@ -2,9 +2,9 @@
 # `source <(logos-devnet env)`. See https://github.com/drptbl/logos-devnet.
 
 [programs]
-# logos-escrow's released guest binary (image 1d646179…): scripts/fetch_escrow.sh
-# downloads it and checks its sha256.
-escrow = "target/escrow/logos_escrow.bin"
+# logos-escrow's released guest binary (image 1d646179…), downloaded once and
+# deployed only if its sha256 matches.
+escrow = { url = "https://github.com/drptbl/logos-escrow/releases/download/v0.1.0/logos_escrow.bin", sha256 = "e39f35af4f8b93ee5e1ca0ecb6c4f524c43c4446a8a6ad56d8c7d3fde7c3deb5" }
 
 # One logosctl session per side of a job, as scripts/demo_escrow_job.py takes them.
 [sessions.agents-provider]
