@@ -4005,3 +4005,205 @@ async fn one_server_at_a_time_runs_a_wallets_services() {
         [format!("service_claim {JOB}")]
     );
 }
+
+#[tokio::test]
+async fn a_server_taking_over_reads_the_records_the_first_one_left() {
+    let q = escrow_quote_text(PROVIDER_ACCOUNT, FAR, FAR + 600_000);
+    let fresh = || {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            history(&[(true, &request_text()), (false, &q)]),
+        );
+        fake.reset("lez_core.get_balance", lez("get_balance", r#""5000000""#));
+        fake.set("lez_core.get_account_public", no_job_record());
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("open1"),
+        );
+        fake
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let first = services_server_in(fresh(), dir.path());
+    let fake = fresh();
+    let second = services_server_in(fake.clone(), dir.path());
+    // The second reads the records while the first still runs the wallet.
+    second.service_jobs().await.unwrap();
+    first
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    drop(first);
+    // Taking over, it sees the open the first sent, and doesn't open again.
+    second
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_escrow_call_that_could_not_be_noted_blocks_nothing_once_saving_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim1"),
+    );
+    let (s, dir) = services_server(fake.clone());
+    s.one_at_a_time("other-job", async { Ok::<_, String>(()) })
+        .await
+        .unwrap();
+    let mode =
+        |m| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(m)).unwrap();
+    // The wallet's folder can't be written: the claim isn't noted, so it isn't sent.
+    mode(0o555);
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    mode(0o755);
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+    // Writable again, the claim goes out: nothing was left waiting in memory.
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_retry_keeps_the_output_that_may_still_land() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("deliver1"),
+    );
+    let (s, dir) = services_server(fake.clone());
+    s.service_deliver(deliver_done()).await.unwrap();
+    // Another output while the first delivery may still land: refused, and
+    // the first output stays kept, ready to send once it does.
+    let r = s
+        .service_deliver(Parameters(DeliverParams {
+            job: JOB.into(),
+            output_text: Some("something else".into()),
+            output_cid: None,
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    let kept = std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
+    assert!(kept.contains("\"done\""), "{kept}");
+    assert!(!kept.contains("something else"), "{kept}");
+}
+
+#[tokio::test]
+async fn a_payment_dropped_mid_send_is_not_paid_again() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (true, &request_text()),
+            (false, &quote_text("logos.dev", FAR)),
+        ]),
+    );
+    fake.hangs
+        .lock()
+        .unwrap()
+        .insert("lez_core.transfer_public".into());
+    let (s, _dir) = services_server(fake.clone());
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        s.service_pay(CancellationToken::new(), pay()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the transfer should still be waiting");
+    fake.hangs.lock().unwrap().clear();
+    // The transfer may have gone out: the retry doesn't send another.
+    let r = s
+        .service_pay(CancellationToken::new(), pay())
+        .await
+        .unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert_eq!(fake.calls_to("lez_core.transfer_public").len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_needs_no_wallet() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (true, &request_text()),
+            (false, &quote_text("logos.dev", FAR)),
+        ]),
+    );
+    let s = AgentServer::new(LogosServer::new(
+        Arc::new(Logosctl::new(fake.clone())),
+        Arc::new(EventStore::default()),
+        None,
+        NodeSettings {
+            preset: "logos.dev".into(),
+            mode: "Edge".into(),
+            config_dir: None,
+            wallet: None,
+            discovery_bootstrap: vec![FLEET_PEER.into()],
+            host_owns_messaging: false,
+            delivery_config: None,
+        },
+    ));
+    let r = s
+        .service_cancel(Parameters(CancelParams {
+            job: JOB.into(),
+            reason: None,
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+}
+
+#[tokio::test]
+async fn a_second_server_on_a_wallet_does_not_advertise() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = services_server_in(node(), dir.path());
+    first
+        .one_at_a_time("other-job", async { Ok::<_, String>(()) })
+        .await
+        .unwrap();
+    let fake = node();
+    let second = services_server_in(fake.clone(), dir.path());
+    let r = second.service_offer(offer()).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        text(&r).contains("another logos-agents server"),
+        "{}",
+        text(&r)
+    );
+    assert!(
+        fake.calls_to("libp2p_module.discoStartAdvertising")
+            .is_empty()
+    );
+}
