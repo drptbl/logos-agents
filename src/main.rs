@@ -54,8 +54,19 @@ async fn provide(file: PathBuf, args: Vec<OsString>) -> anyhow::Result<()> {
     });
     stopped().await;
     advertising.abort();
-    // Stop advertising, so buyers don't find an offer nobody serves.
-    server.apply_offers(&[]).await;
+    // Stop advertising, so buyers don't find an offer nobody serves. A stop
+    // that fails is tried twice more, briefly: the process is on its way out.
+    for _ in 0..3 {
+        let results = server.apply_offers(&[]).await;
+        let failed = results
+            .as_object()
+            .is_some_and(|all| all.values().any(|r| r.get("error").is_some()));
+        if !failed {
+            break;
+        }
+        tracing::warn!("offers not all withdrawn: {results}");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
     // Now, not once a handler still at work answers: that can take hours. A
     // restart asks it again, and the job id lets it answer as before.
     std::process::exit(0)

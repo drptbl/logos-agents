@@ -2199,22 +2199,22 @@ impl AgentServer {
             return fail(e);
         }
         let _advertising = self.advertising.lock().await;
-        {
-            // A stopped offer's paid jobs still get done.
-            let mut state = self.services.lock().await;
-            if let Some(auto) = state.offers.remove(&p.service_id).and_then(|o| o.auto) {
-                state.retired.insert(p.service_id.clone(), auto);
-            }
-        }
-        match self
+        // Forgotten only once discovery stops showing it, so a stop that
+        // fails is still there to try again.
+        if let Err(e) = self
             .base
             .node()
             .call(P2P, "discoStopAdvertising", &[Arg::str(&p.service_id)])
             .await
         {
-            Ok(_) => ok(json!({ "stopped": p.service_id })),
-            Err(e) => logos_fail(e),
+            return logos_fail(e);
         }
+        // A stopped offer's paid jobs still get done.
+        let mut state = self.services.lock().await;
+        if let Some(auto) = state.offers.remove(&p.service_id).and_then(|o| o.auto) {
+            state.retired.insert(p.service_id.clone(), auto);
+        }
+        ok(json!({ "stopped": p.service_id }))
     }
 
     #[tool(
