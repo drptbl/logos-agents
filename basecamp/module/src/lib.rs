@@ -149,6 +149,8 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
         }),
         discovery_bootstrap: config.discovery_bootstrap.clone(),
         host_owns_messaging: true,
+        // Basecamp runs its own messaging node.
+        delivery_config: None,
     };
     let events = Arc::new(EventStore::default());
     let node: Arc<dyn Node> = Arc::new(InProcessNode);
