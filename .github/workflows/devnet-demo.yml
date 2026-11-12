@@ -37,7 +37,7 @@ jobs:
       - run: cargo build --locked
       # Installs logosctl for the sessions, then starts the devnet from logos-devnet.toml:
       # the escrow and a logosctl session per side.
-      - uses: drptbl/logos-devnet@v0.3.8
+      - uses: drptbl/logos-devnet@v0.4.0
       - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
       # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
       - if: always()
