@@ -544,7 +544,7 @@ Item {
                             LogosText { text: qsTr("Quote URL") }
                             TextField {
                                 Layout.fillWidth: true
-                                enabled: !!modelData.handler
+                                enabled: !!modelData.handler || !!modelData.quote_handler
                                 placeholderText: qsTr("prices each request, or empty for the price above")
                                 text: modelData.quote_handler || ""
                                 onEditingFinished: if (text !== (modelData.quote_handler || "")) root.setOffer(index, "quote_handler", text)
