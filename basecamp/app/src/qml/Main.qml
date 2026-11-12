@@ -33,15 +33,13 @@ Item {
         offersEdited = true
     }
 
+    // The reply comes later: a refused save keeps the edits and says why.
     function saveOffers() {
-        const reply = parse(backend.saveOffers(JSON.stringify(offerDraft)), {})
-        if (reply.error) {
-            notice = reply.error
-            return
-        }
-        offersEdited = false
-        offerDraft = (reply.offers || []).slice()
-        notice = qsTr("Offers saved")
+        call(backend.saveOffers(JSON.stringify(offerDraft)), function (reply) {
+            offersEdited = false
+            offerDraft = (reply.offers || []).slice()
+            notice = qsTr("Offers saved")
+        })
     }
     // The account waiting for the user to confirm handing it over.
     property var handOver: null
