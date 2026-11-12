@@ -74,7 +74,8 @@ def serve_handler():
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default="target/debug/logos-agents")
-    ap.add_argument("--price", default="1000000", help="lepta per job")
+    ap.add_argument("--price", default="1000000",
+                    help="the offer's own price in lepta, which the quote handler replaces with its per-word price")
     ap.add_argument("--service", default=f"logos-agents-demo/provider/v{int(time.time())}")
     ap.add_argument("--timeout", type=int, default=600, help="seconds to wait for each step")
     ap.add_argument("--poll", type=demo.poll_secs, default=3, help="seconds between checks")

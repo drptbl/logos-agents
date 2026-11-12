@@ -35,7 +35,7 @@ Either way, the server advertises the offers when it starts, and again after a r
 
 ## A job
 
-1. A buyer's request arrives. If the offer has room under `max_jobs`, the server quotes it at the offer's price and deadline. If not, it declines with "busy, try again later".
+1. A buyer's request arrives. If the offer has room under `max_jobs`, the server quotes it at the offer's price, or the one its quote handler sets, and at its delivery window. If not, it declines with "busy, try again later".
 2. The buyer pays into escrow. Once the payment lands, the server POSTs the job to the handler.
 3. The handler answers, and the server records the delivery in escrow, keeping the output first.
 4. The follow-through sends the result once the delivery lands, then claims.
@@ -92,8 +92,11 @@ Content-Type: application/json
 | Answer | What the server does |
 | --- | --- |
 | `200` with a price | quotes it, at the window given or the offer's |
-| `4xx`, a redirect, or a price that isn't a whole number of lepta above zero | turns the request away, with the response body as the reason |
-| `5xx`, a timeout or no connection | leaves the request for the next pass |
+| `4xx` or a redirect | turns the request away, with the response body as the reason |
+| a price that isn't a whole number of lepta above zero | turns the request away, as one the provider couldn't price |
+| `5xx`, a timeout or no connection | leaves the request for the next pass. The offer's other requests wait too, so a handler that's down costs one timeout a pass |
+
+The same request can reach the quote handler more than once, after it failed for now. The agent's own `service_quote` asks it too, for an offer that has one.
 
 ## What it builds on
 
