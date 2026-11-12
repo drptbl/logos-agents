@@ -1,0 +1,51 @@
+# A paid job between two agents on a local LEZ devnet: scripts/demo_escrow_job.py with
+# --decline, each tool called once and the follow-through doing the rest. Chat and
+# discovery go over the public logos.dev fleet, so this runs on demand and on PRs that
+# change the demo itself, rather than gating every PR on that network.
+name: devnet demo
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - .github/workflows/devnet-demo.yml
+      - logos-devnet.toml
+      - scripts/demo_escrow_job.py
+      - scripts/e2e.py
+      - scripts/devnet_wallets.sh
+      - scripts/fetch_escrow.sh
+      - scripts/logos-dev-peers.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devnet-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  demo:
+    # The devnet runs in Docker, so it needs a Linux runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked
+      - run: scripts/fetch_escrow.sh
+      # Installs logosctl for the sessions, then starts the devnet from logos-devnet.toml:
+      # the escrow and a logosctl session per side.
+      - uses: drptbl/logos-devnet@v0.3.6
+      - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
+      # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: devnet-demo-logs
+          path: /tmp/logos-mcp-demo-*
+          if-no-files-found: ignore

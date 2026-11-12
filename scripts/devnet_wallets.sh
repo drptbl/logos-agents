@@ -48,7 +48,7 @@ for side in provider buyer; do
   fi
   logos-devnet wallet-config "$wallet" >/dev/null
   logosctl module reload lez_core >/dev/null
-  logosctl call lez_core create_new "str:$wallet/wallet_config.json" "str:$wallet/storage.json" str: | result create_new >/dev/null
+  logosctl call lez_core create_new "str:$wallet/wallet_config.json" "str:$wallet/storage.json" str: 2>/dev/null | result create_new >/dev/null
   hex=$(logosctl call lez_core create_account_public | result create_account_public)
   account="Public/$(base58 "$hex")"
   logosctl call lez_core save | result save >/dev/null

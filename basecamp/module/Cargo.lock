@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "logos_agents_module"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "logos-agents",

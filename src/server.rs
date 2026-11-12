@@ -32,8 +32,36 @@ const LEZ: &str = "lez_core";
 const P2P: &str = "libp2p_module";
 const CHAT: &str = "chat_module";
 
-/// How often the follow-through looks at every job.
+/// How often the follow-through looks at every job, unless
+/// [`FOLLOW_THROUGH_ENV`] says otherwise.
 const FOLLOW_THROUGH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Sets the follow-through's interval in seconds, 1 to 3600: a few seconds
+/// suits a local devnet, whose blocks land in one.
+pub const FOLLOW_THROUGH_ENV: &str = "LOGOS_AGENTS_FOLLOW_THROUGH_SECS";
+
+/// The follow-through's interval, from [`FOLLOW_THROUGH_ENV`] or the default.
+pub fn follow_through_every() -> Result<std::time::Duration, String> {
+    let secs = match std::env::var(FOLLOW_THROUGH_ENV) {
+        Err(std::env::VarError::NotPresent) => return Ok(FOLLOW_THROUGH_EVERY),
+        Ok(secs) => secs,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{FOLLOW_THROUGH_ENV} is not UTF-8"));
+        }
+    };
+    parse_follow_through(&secs)
+}
+
+fn parse_follow_through(secs: &str) -> Result<std::time::Duration, String> {
+    secs.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|s| (1..=3600).contains(s))
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| {
+            format!("{FOLLOW_THROUGH_ENV} must be whole seconds from 1 to 3600, not {secs:?}")
+        })
+}
 
 fn ok(value: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
@@ -94,7 +122,7 @@ impl AgentServer {
     }
 
     /// Take the steps that only wait on the chain, for every job, every
-    /// minute from now on: see [`jobs`]. Runs once however often it is
+    /// [`follow_through_every`] from now on: see [`jobs`]. Runs once however often it is
     /// called, until the tokio runtime it was called in stops.
     pub fn start_follow_through(&self) {
         if self.following.set(()).is_err() {
@@ -102,7 +130,9 @@ impl AgentServer {
         }
         let server = self.clone();
         tokio::spawn(async move {
-            let mut every = tokio::time::interval(FOLLOW_THROUGH_EVERY);
+            // Checked at startup with the rest of the env: see `check_env`.
+            let mut every =
+                tokio::time::interval(follow_through_every().unwrap_or(FOLLOW_THROUGH_EVERY));
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 every.tick().await;
