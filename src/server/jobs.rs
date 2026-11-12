@@ -731,15 +731,15 @@ impl AgentServer {
         state
     }
 
-    /// Remember (`Some`) or forget (`None`) a job's escrow call, dropping
-    /// ones too old to wait for.
-    /// Save, or forget, the escrow call in flight for `job`. An error means
-    /// the record didn't reach the file.
+    /// Save (`Some`) or forget (`None`) the escrow call in flight for `job`,
+    /// dropping ones too old to wait for. An error means the record didn't
+    /// reach the file, and memory keeps what the file holds.
     async fn note_in_flight(&self, job: &str, call: Option<InFlight>) -> Result<(), String> {
         let mut state = self.with_in_flight().await;
         if let Some(e) = &state.in_flight_unreadable {
             return Err(unreadable_in_flight(e));
         }
+        let before = state.in_flight.clone();
         match call {
             Some(f) => state.in_flight.insert(job.to_string(), f),
             None => state.in_flight.remove(job),
@@ -748,14 +748,28 @@ impl AgentServer {
         state
             .in_flight
             .retain(|_, f| now.saturating_sub(f.sent_ms) < IN_FLIGHT_MS);
-        let file = self
-            .base
-            .wallet_side_file(IN_FLIGHT)
-            .ok_or("no wallet configured")?;
-        serde_json::to_vec_pretty(&state.in_flight)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
-            .map_err(|e| format!("could not save the escrow calls in flight: {e}"))
+        let saved = match self.base.wallet_side_file(IN_FLIGHT) {
+            Some(file) => serde_json::to_vec_pretty(&state.in_flight)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string())),
+            None => Err("no wallet configured".into()),
+        };
+        if let Err(e) = saved {
+            state.in_flight = before;
+            return Err(format!("could not save the escrow calls in flight: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Whether an escrow call for `job` was sent recently enough that it may
+    /// still land. An unreadable record counts as one.
+    async fn in_flight_recent(&self, job: &str) -> bool {
+        let state = self.with_in_flight().await;
+        state.in_flight_unreadable.is_some()
+            || state
+                .in_flight
+                .get(job)
+                .is_some_and(|f| now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS)
     }
 
     /// Send a job's escrow instruction, read in state `seen`, unless an
