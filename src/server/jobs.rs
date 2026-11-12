@@ -306,32 +306,58 @@ impl AgentServer {
     /// Take this wallet's service lock, once per server: another server
     /// holding it runs this wallet's jobs. The OS releases it when the
     /// server stops, however it stops.
-    async fn hold_wallet(&self) -> Result<(), String> {
+    async fn hold_wallet(&self) -> Result<(), WalletLock> {
         let mut state = self.services.lock().await;
         if state.wallet_lock.is_some() {
             return Ok(());
         }
-        let path = self
-            .base
-            .wallet_side_file(SERVICE_LOCK)
-            .ok_or("no wallet configured")?;
+        // No wallet, no records to guard.
+        let Some(path) = self.base.wallet_side_file(SERVICE_LOCK) else {
+            return Ok(());
+        };
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
-            .map_err(|e| format!("can't open {SERVICE_LOCK} next to the wallet: {e}"))?;
+            .map_err(|e| {
+                WalletLock::Failed(format!("can't open {SERVICE_LOCK} next to the wallet: {e}"))
+            })?;
         match file.try_lock() {
             Ok(()) => {
                 state.wallet_lock = Some(file);
+                // What was read before belongs to the server that held the
+                // wallet then: read it again, so it isn't written back stale.
+                state.submitted.clear();
+                state.payments_loaded = false;
+                state.payments_unreadable = None;
+                state.in_flight.clear();
+                state.in_flight_loaded = false;
+                state.in_flight_unreadable = None;
                 Ok(())
             }
-            Err(std::fs::TryLockError::WouldBlock) => Err(
-                "another logos-agents server is running this wallet's services: run one per wallet, or give each its own wallet".into(),
+            Err(std::fs::TryLockError::WouldBlock) => Err(WalletLock::HeldElsewhere),
+            Err(std::fs::TryLockError::Error(e)) => Err(WalletLock::Failed(format!(
+                "can't lock {SERVICE_LOCK} next to the wallet: {e}"
+            ))),
+        }
+    }
+}
+
+/// Why this server can't run its wallet's services.
+#[derive(Debug)]
+enum WalletLock {
+    HeldElsewhere,
+    Failed(String),
+}
+
+impl std::fmt::Display for WalletLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeldElsewhere => f.write_str(
+                "another logos-agents server is running this wallet's services: run one per wallet, or give each its own wallet",
             ),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(format!("can't lock {SERVICE_LOCK} next to the wallet: {e}"))
-            }
+            Self::Failed(e) => f.write_str(e),
         }
     }
 }
@@ -999,9 +1025,17 @@ impl AgentServer {
     /// work or declines. Returns what it did, as `tool job` lines.
     pub(super) async fn follow_through(&self) -> Vec<String> {
         let mut done = Vec::new();
-        // Another server running this wallet's services follows its jobs through.
-        if !self.follows_through() || self.hold_wallet().await.is_err() {
+        if !self.follows_through() {
             return done;
+        }
+        match self.hold_wallet().await {
+            Ok(()) => {}
+            // Another server running this wallet's services follows its jobs through.
+            Err(WalletLock::HeldElsewhere) => return done,
+            Err(e) => {
+                tracing::warn!("follow-through off: {e}");
+                return done;
+            }
         }
         let Ok(jobs) = self.all_jobs().await else {
             return done;
@@ -1202,6 +1236,10 @@ impl AgentServer {
     ) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.needs(&["chat", "discovery", "wallet"]) {
             return fail(e);
+        }
+        // Another server running this wallet's services would get the requests.
+        if let Err(e) = self.hold_wallet().await {
+            return fail(e.to_string());
         }
         if let Err(e) = guard::validate_service_id(&p.service_id) {
             return fail(e);
@@ -1471,7 +1509,7 @@ impl AgentServer {
             return fail(e);
         }
         if let Err(e) = self.hold_wallet().await {
-            return fail(e);
+            return fail(e.to_string());
         }
         // One quote at a time, so a job never gets two accounts.
         let _quoting = self.quoting.lock().await;
@@ -2278,7 +2316,7 @@ impl AgentServer {
         job: &str,
         work: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
-        self.hold_wallet().await?;
+        self.hold_wallet().await.map_err(|e| e.to_string())?;
         let set = self.services.lock().await.busy.clone();
         let Some(_held) = Busy::claim(set, job) else {
             return Err(format!(
