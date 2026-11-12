@@ -1155,6 +1155,9 @@ impl AgentServer {
                 state.retired.clone(),
             )
         };
+        // Quote handlers that failed this pass: their offer's other requests
+        // wait for the next, rather than each costing a timeout.
+        let mut hook_down = BTreeSet::<String>::new();
         // What each offer has taken: quotes still open, and handlers at work.
         // A payment only claimed in chat takes nothing until a handler runs.
         let now = now_ms();
@@ -1200,7 +1203,7 @@ impl AgentServer {
                 })
                 .filter(|_| found.job.role == Role::Provider);
             let provided = match &auto {
-                Some(auto) => self.provide(&found, auto, &mut taken).await,
+                Some(auto) => self.provide(&found, auto, &mut taken, &mut hook_down).await,
                 None => Ok(None),
             };
             let step = match provided {
@@ -1236,6 +1239,7 @@ impl AgentServer {
         found: &Found,
         auto: &Auto,
         taken: &mut BTreeMap<String, u32>,
+        hook_down: &mut BTreeSet<String>,
     ) -> Result<Option<(&'static str, Value)>, String> {
         let Found { can_send, job, .. } = found;
         if !*can_send {
@@ -1248,6 +1252,9 @@ impl AgentServer {
                     let v = self.reject_job(&job.job, BUSY).await?;
                     return Ok(Some(("service_reject", v)));
                 }
+                if auto.quote.is_some() && hook_down.contains(&job.service) {
+                    return Ok(None);
+                }
                 let terms = match &auto.quote {
                     None => None,
                     Some(url) => match self.ask_price(url, job).await {
@@ -1256,12 +1263,18 @@ impl AgentServer {
                             deliver_within_s,
                         } => Some((price_lepta, deliver_within_s)),
                         crate::provider::Priced::Declined(reason) => {
+                            // Unless the agent quoted it meanwhile.
+                            let (_, now) = self.find_job(&job.job, Role::Provider).await?;
+                            if now.state != State::Requested {
+                                return Ok(None);
+                            }
                             let v = self.reject_job(&job.job, &reason).await?;
                             return Ok(Some(("service_reject", v)));
                         }
                         // The request waits for the next pass.
                         crate::provider::Priced::Retry(e) => {
                             tracing::warn!(job = %job.job, "quote handler failed for now: {e}");
+                            hook_down.insert(job.service.clone());
                             return Ok(None);
                         }
                     },
@@ -2033,10 +2046,43 @@ impl AgentServer {
         &self,
         Parameters(p): Parameters<JobParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.quote(&p.job, None).await {
+        match self.agent_quote(&p.job).await {
             Ok(v) => ok(v),
             Err(e) => fail(e),
         }
+    }
+
+    /// The agent's own quote: at the price an offer's quote handler sets,
+    /// when it has one, as the provider's own quotes are.
+    async fn agent_quote(&self, id: &str) -> Result<Value, String> {
+        let (_, job) = self.find_job(id, Role::Provider).await?;
+        let hook = self
+            .services
+            .lock()
+            .await
+            .offers
+            .get(&job.service)
+            .and_then(|o| o.auto.as_ref().and_then(|a| a.quote.clone()));
+        let terms = match hook {
+            None => None,
+            Some(url) => match self.ask_price(&url, &job).await {
+                crate::provider::Priced::Price {
+                    price_lepta,
+                    deliver_within_s,
+                } => Some((price_lepta, deliver_within_s)),
+                crate::provider::Priced::Declined(reason) => {
+                    return Err(format!(
+                        "the offer's quote handler turned this request away: {reason}"
+                    ));
+                }
+                crate::provider::Priced::Retry(e) => {
+                    return Err(format!(
+                        "the offer's quote handler can't price this request now: {e}"
+                    ));
+                }
+            },
+        };
+        self.quote(id, terms).await
     }
 
     /// Quote job `id` at the offer's terms, or at `terms`: a price, and maybe

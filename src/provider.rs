@@ -247,6 +247,8 @@ fn handler_agent(timeout: Duration) -> ureq::Agent {
 
 /// What came back from a handler: its status and body, or why nothing did.
 enum Exchange {
+    /// The request couldn't be encoded: the same next time.
+    Unsendable(String),
     Answered {
         status: ureq::http::StatusCode,
         /// The body, or why it couldn't be read: too big, or not text.
@@ -258,7 +260,7 @@ enum Exchange {
 /// POST `request` as JSON to `url`, waiting at most `timeout`. Blocking.
 fn exchange(url: &str, request: &impl Serialize, timeout: Duration) -> Exchange {
     let Ok(body) = serde_json::to_vec(request) else {
-        return Exchange::Failed("the request couldn't be encoded".into());
+        return Exchange::Unsendable("the request couldn't be encoded".into());
     };
     let agent = handler_agent(timeout);
     let sent = agent
@@ -298,6 +300,7 @@ fn reason(body: Result<String, String>, status: ureq::http::StatusCode) -> Strin
 pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> Answer {
     let (status, body) = match exchange(url, job, timeout) {
         Exchange::Answered { status, body } => (status, body),
+        Exchange::Unsendable(e) => return Answer::Declined(e),
         Exchange::Failed(e) => return Answer::Retry(e),
     };
     if status.is_success() {
@@ -352,20 +355,25 @@ struct Price {
 pub fn call_quote(url: &str, request: &QuoteRequest<'_>, timeout: Duration) -> Priced {
     let (status, body) = match exchange(url, request, timeout) {
         Exchange::Answered { status, body } => (status, body),
+        Exchange::Unsendable(e) => return Priced::Declined(e),
         Exchange::Failed(e) => return Priced::Retry(e),
     };
     if status.is_success() {
         let price = body.and_then(|b| serde_json::from_str::<Price>(&b).map_err(|e| e.to_string()));
+        // In its plain form: a padded price is one the protocol won't read.
         return match price {
             Ok(p)
-                if guard::amount_le16_hex(&p.price_lepta).is_ok()
-                    && !p.price_lepta.trim_start_matches('0').is_empty()
-                    && p.deliver_within_s
-                        .is_none_or(|s| (1..=MAX_DELIVER_S).contains(&s)) =>
+                if p.deliver_within_s
+                    .is_none_or(|s| (1..=MAX_DELIVER_S).contains(&s)) =>
             {
-                Priced::Price {
-                    price_lepta: p.price_lepta,
-                    deliver_within_s: p.deliver_within_s,
+                match p.price_lepta.parse::<u128>() {
+                    Ok(lepta) if lepta > 0 && p.price_lepta.bytes().all(|b| b.is_ascii_digit()) => {
+                        Priced::Price {
+                            price_lepta: lepta.to_string(),
+                            deliver_within_s: p.deliver_within_s,
+                        }
+                    }
+                    _ => Priced::Declined("the provider couldn't price this request".into()),
                 }
             }
             Ok(_) => Priced::Declined("the provider couldn't price this request".into()),
