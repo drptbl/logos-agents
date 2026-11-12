@@ -247,3 +247,78 @@ fn a_handler_on_this_machine_is_reached_without_a_proxy() {
         Answer::Output(Payload::Text("a summary".into()))
     );
 }
+
+#[test]
+fn a_quote_handler_needs_a_handler_and_stays_on_this_machine() {
+    let one = |body: &str| {
+        format!("[[offer]]\nservice_id = \"a/b/v1\"\ntag = \"t\"\nprice_lepta = \"1\"\n{body}")
+    };
+    let ok = parse_offers(&one(
+        "handler = \"http://127.0.0.1:1/run\"\nquote_handler = \"http://127.0.0.1:1/quote\"",
+    ))
+    .unwrap();
+    assert_eq!(
+        ok[0].quote_handler.as_deref(),
+        Some("http://127.0.0.1:1/quote")
+    );
+    assert!(parse_offers(&one("quote_handler = \"http://127.0.0.1:1/quote\"")).is_err());
+    assert!(parse_offers(&one("handler = \"http://127.0.0.1:1/run\"\nquote_handler = \"https://pricing.example.com/q\"")).is_err());
+}
+
+fn quote_request() -> QuoteRequest<'static> {
+    static INPUT: std::sync::LazyLock<Payload> =
+        std::sync::LazyLock::new(|| Payload::Text("summarise this".into()));
+    QuoteRequest {
+        job: "j1",
+        service_id: "acme/summarize/v1",
+        input: &INPUT,
+        price_lepta: "1000000",
+    }
+}
+
+#[test]
+fn a_quote_handler_prices_declines_or_waits() {
+    let (url, served) = stub(
+        "200 OK",
+        r#"{"price_lepta": "2500000", "deliver_within_s": 120}"#,
+    );
+    assert_eq!(
+        call_quote(&url, &quote_request(), Duration::from_secs(5)),
+        Priced::Price {
+            price_lepta: "2500000".into(),
+            deliver_within_s: Some(120),
+        }
+    );
+    let seen = served.join().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&seen[seen.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(body["input"], serde_json::json!({"text": "summarise this"}));
+    assert_eq!(body["price_lepta"], "1000000");
+
+    let (url, _served) = stub("422 Unprocessable Entity", "too long to summarise");
+    assert_eq!(
+        call_quote(&url, &quote_request(), Duration::from_secs(5)),
+        Priced::Declined("too long to summarise".into())
+    );
+    let (url, _served) = stub("503 Service Unavailable", "");
+    assert!(matches!(
+        call_quote(&url, &quote_request(), Duration::from_secs(5)),
+        Priced::Retry(_)
+    ));
+    // A price that isn't one declines, rather than asking the same thing again.
+    for bad in [
+        r#"{"price_lepta": "0"}"#,
+        r#"{"price_lepta": "1.5"}"#,
+        r#"{"price_lepta": "5", "deliver_within_s": 0}"#,
+        r#"{"cost": 5}"#,
+    ] {
+        let (url, _served) = stub("200 OK", bad);
+        assert!(
+            matches!(
+                call_quote(&url, &quote_request(), Duration::from_secs(5)),
+                Priced::Declined(_)
+            ),
+            "{bad}"
+        );
+    }
+}

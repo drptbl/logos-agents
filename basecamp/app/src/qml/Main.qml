@@ -541,6 +541,14 @@ Item {
                                 text: modelData.handler || ""
                                 onEditingFinished: if (text !== (modelData.handler || "")) root.setOffer(index, "handler", text)
                             }
+                            LogosText { text: qsTr("Quote URL") }
+                            TextField {
+                                Layout.fillWidth: true
+                                enabled: !!modelData.handler || !!modelData.quote_handler
+                                placeholderText: qsTr("prices each request, or empty for the price above")
+                                text: modelData.quote_handler || ""
+                                onEditingFinished: if (text !== (modelData.quote_handler || "")) root.setOffer(index, "quote_handler", text)
+                            }
                             LogosText { text: qsTr("Jobs at once") }
                             SpinBox {
                                 from: 1; to: 100; editable: true

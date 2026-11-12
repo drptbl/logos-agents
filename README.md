@@ -51,7 +51,7 @@ max_jobs = 1
 logos-agents provide offers.toml
 ```
 
-In Basecamp, set offers in the Agent Services app's Offers tab instead. [docs/providers.md](docs/providers.md) has the handler's request and answer. `scripts/demo_provider.py` runs one on the local devnet, after `logos-devnet up`.
+To price each request rather than charge `price_lepta`, add a `quote_handler`, a second endpoint that answers what a request costs. In Basecamp, set offers in the Agent Services app's Offers tab instead. [docs/providers.md](docs/providers.md) has the handler's request and answer. `scripts/demo_provider.py` runs one on the local devnet, after `logos-devnet up`.
 
 ## Requirements
 

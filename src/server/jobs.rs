@@ -32,6 +32,8 @@ const OFFERS_RETRY: std::time::Duration = if cfg!(test) {
 /// The time a handler leaves for its answer to be delivered, on top of the
 /// deadline's margin.
 const DELIVER_SLACK_MS: u64 = 60 * 1000;
+/// How long a quote handler has to price a request: it holds up the pass.
+const QUOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The reason a full offer gives the buyer.
 const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Room kept in a chat message for the protocol fields around a text input or output.
@@ -79,6 +81,8 @@ struct Offer {
 #[derive(Debug, Clone)]
 struct Auto {
     handler: String,
+    /// Where requests are priced, when not at the offer's price.
+    quote: Option<String>,
     max_jobs: u32,
 }
 
@@ -1151,6 +1155,9 @@ impl AgentServer {
                 state.retired.clone(),
             )
         };
+        // Quote handlers that failed this pass: their offer's other requests
+        // wait for the next, rather than each costing a timeout.
+        let mut hook_down = BTreeSet::<String>::new();
         // What each offer has taken: quotes still open, and handlers at work.
         // A payment only claimed in chat takes nothing until a handler runs.
         let now = now_ms();
@@ -1196,7 +1203,7 @@ impl AgentServer {
                 })
                 .filter(|_| found.job.role == Role::Provider);
             let provided = match &auto {
-                Some(auto) => self.provide(&found, auto, &mut taken).await,
+                Some(auto) => self.provide(&found, auto, &mut taken, &mut hook_down).await,
                 None => Ok(None),
             };
             let step = match provided {
@@ -1232,6 +1239,7 @@ impl AgentServer {
         found: &Found,
         auto: &Auto,
         taken: &mut BTreeMap<String, u32>,
+        hook_down: &mut BTreeSet<String>,
     ) -> Result<Option<(&'static str, Value)>, String> {
         let Found { can_send, job, .. } = found;
         if !*can_send {
@@ -1244,18 +1252,69 @@ impl AgentServer {
                     let v = self.reject_job(&job.job, BUSY).await?;
                     return Ok(Some(("service_reject", v)));
                 }
-                let v = tool_json(
-                    self.service_quote(Parameters(JobParams {
-                        job: job.job.clone(),
-                    }))
-                    .await,
-                )?;
+                if auto.quote.is_some() && hook_down.contains(&job.service) {
+                    return Ok(None);
+                }
+                let terms = match &auto.quote {
+                    None => None,
+                    Some(url) => match self.ask_price(url, job).await {
+                        crate::provider::Priced::Price {
+                            price_lepta,
+                            deliver_within_s,
+                        } => Some((price_lepta, deliver_within_s)),
+                        crate::provider::Priced::Declined(reason) => {
+                            // Unless the agent quoted it meanwhile.
+                            let (_, now) = self.find_job(&job.job, Role::Provider).await?;
+                            if now.state != State::Requested {
+                                return Ok(None);
+                            }
+                            let v = self.reject_job(&job.job, &reason).await?;
+                            return Ok(Some(("service_reject", v)));
+                        }
+                        // The request waits for the next pass.
+                        crate::provider::Priced::Retry(e) => {
+                            tracing::warn!(job = %job.job, "quote handler failed for now: {e}");
+                            hook_down.insert(job.service.clone());
+                            return Ok(None);
+                        }
+                    },
+                };
+                let v = self.quote(&job.job, terms).await?;
                 *held += 1;
                 Ok(Some(("service_quote", v)))
             }
             State::Paid => self.start_handler(job, auto).await,
             _ => Ok(None),
         }
+    }
+
+    /// Ask an offer's quote handler what a request costs.
+    async fn ask_price(&self, url: &str, job: &Job) -> crate::provider::Priced {
+        let base = self
+            .services
+            .lock()
+            .await
+            .offers
+            .get(&job.service)
+            .map(|o| o.price_lepta.clone())
+            .unwrap_or_default();
+        let (url, id, service, input) = (
+            url.to_string(),
+            job.job.clone(),
+            job.service.clone(),
+            job.input.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let asked = crate::provider::QuoteRequest {
+                job: &id,
+                service_id: &service,
+                input: &input,
+                price_lepta: &base,
+            };
+            crate::provider::call_quote(&url, &asked, QUOTE_TIMEOUT)
+        })
+        .await
+        .unwrap_or_else(|e| crate::provider::Priced::Retry(e.to_string()))
     }
 
     /// Start the handler for a job paid on its quote's terms, unless one runs
@@ -1619,6 +1678,7 @@ impl AgentServer {
         };
         let auto = spec.handler.clone().map(|handler| Auto {
             handler,
+            quote: spec.quote_handler.clone(),
             max_jobs: spec.max_jobs,
         });
         self.offer(p, auto, true).await
@@ -1986,53 +2046,93 @@ impl AgentServer {
         &self,
         Parameters(p): Parameters<JobParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.needs(&["chat", "wallet"]) {
-            return fail(e);
+        match self.agent_quote(&p.job).await {
+            Ok(v) => ok(v),
+            Err(e) => fail(e),
         }
-        if let Err(e) = self.hold_wallet().await {
-            return fail(e.to_string());
-        }
+    }
+
+    /// The agent's own quote: at the price an offer's quote handler sets,
+    /// when it has one, as the provider's own quotes are.
+    async fn agent_quote(&self, id: &str) -> Result<Value, String> {
+        let (_, job) = self.find_job(id, Role::Provider).await?;
+        let hook = self
+            .services
+            .lock()
+            .await
+            .offers
+            .get(&job.service)
+            .and_then(|o| o.auto.as_ref().and_then(|a| a.quote.clone()));
+        let terms = match hook {
+            None => None,
+            Some(url) => match self.ask_price(&url, &job).await {
+                crate::provider::Priced::Price {
+                    price_lepta,
+                    deliver_within_s,
+                } => Some((price_lepta, deliver_within_s)),
+                crate::provider::Priced::Declined(reason) => {
+                    return Err(format!(
+                        "the offer's quote handler turned this request away: {reason}"
+                    ));
+                }
+                crate::provider::Priced::Retry(e) => {
+                    return Err(format!(
+                        "the offer's quote handler can't price this request now: {e}"
+                    ));
+                }
+            },
+        };
+        self.quote(id, terms).await
+    }
+
+    /// Quote job `id` at the offer's terms, or at `terms`: a price, and maybe
+    /// a delivery window, a quote handler set.
+    async fn quote(&self, id: &str, terms: Option<(String, Option<u64>)>) -> Result<Value, String> {
+        let p = JobParams {
+            job: id.to_string(),
+        };
+        self.needs(&["chat", "wallet"])?;
+        self.hold_wallet().await.map_err(|e| e.to_string())?;
         // One quote at a time, so a job never gets two accounts.
         let _quoting = self.quoting.lock().await;
-        let (convo, job) = match self.find_job(&p.job, Role::Provider).await {
-            Ok(found) => found,
-            Err(e) => return fail(e),
-        };
+        let (convo, job) = self.find_job(&p.job, Role::Provider).await?;
         if job.state != State::Requested {
-            return fail(format!("job {} is already {:?}", p.job, job.state).to_lowercase());
+            return Err(format!("job {} is already {:?}", p.job, job.state).to_lowercase());
         }
         let offer = self.services.lock().await.offers.get(&job.service).cloned();
         let Some(offer) = offer else {
-            return fail(format!(
+            return Err(format!(
                 "you are not offering {}: service_offer it first, or service_reject the job",
                 job.service
             ));
         };
-        let account = match tool_json(self.base.wallet_new_account().await) {
-            Ok(account) => account,
-            Err(e) => return fail(format!("could not create the job's account: {e}")),
-        };
+        let account = tool_json(self.base.wallet_new_account().await)
+            .map_err(|e| format!("could not create the job's account: {e}"))?;
         let (Some(pay_to), Some(account_id)) =
             (account["address"].as_str(), account["account_id"].as_str())
         else {
-            return fail(format!("unexpected new account: {account}"));
+            return Err(format!("unexpected new account: {account}"));
         };
         // Its keys would be gone after a restart, and any payment to it with them.
         if account["saved"] != true {
-            return fail(
-                "the wallet didn't confirm saving the job's new account, so a payment to it could be lost: not quoting",
+            return Err(
+                "the wallet didn't confirm saving the job's new account, so a payment to it could be lost: not quoting".into(),
             );
         }
         if let Err(e) = self.record_job_account(account_id, &job.job, &job.service) {
             tracing::warn!("could not save the job accounts: {e}");
         }
+        let (price_lepta, deliver_within_s) = match terms {
+            Some((price, window)) => (price, window.unwrap_or(offer.deliver_within_s)),
+            None => (offer.price_lepta.clone(), offer.deliver_within_s),
+        };
         let expires_at = now_ms() + QUOTE_VALID_MS;
         let body = Body::Quote {
-            price_lepta: offer.price_lepta.clone(),
+            price_lepta,
             pay_to: pay_to.to_string(),
             network: self.base.network().await,
             expires_at,
-            deliver_within_s: offer.deliver_within_s,
+            deliver_within_s,
             // The deadline gives the buyer the quote's whole life to pay and
             // the provider its promised time after that.
             escrow: offer
@@ -2041,16 +2141,12 @@ impl AgentServer {
                 .map(|provider| protocol::EscrowTerms {
                     program: escrow::program().id.clone(),
                     provider: provider.clone(),
-                    deadline: expires_at + offer.deliver_within_s * 1000,
+                    deadline: expires_at + deliver_within_s * 1000,
                 }),
         };
-        if let Err(e) = self
-            .send_message(&convo, &protocol::Message::new(&job.job, body.clone()))
-            .await
-        {
-            return fail(e);
-        }
-        ok(json!({
+        self.send_message(&convo, &protocol::Message::new(&job.job, body.clone()))
+            .await?;
+        Ok(json!({
             "job": job.job,
             "quote": body,
             "note": "sent; once pay_to holds the price, service_jobs shows the job paid",

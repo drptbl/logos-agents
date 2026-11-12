@@ -14,6 +14,7 @@ price_lepta = "1000000"
 deliver_within_s = 3600
 handler = "http://127.0.0.1:8080/summarize"
 max_jobs = 1
+# quote_handler = "http://127.0.0.1:8080/quote"   # prices each request instead of price_lepta
 # escrow_account = "Public/<base58>"   # default: the best-funded agent account
 # remote_handler = true                # allow a handler that isn't on this machine
 ```
@@ -23,6 +24,7 @@ max_jobs = 1
 | `service_id`, `tag`, `price_lepta`, `deliver_within_s`, `escrow_account` | as `service_offer` takes them |
 | `handler` | the URL the server POSTs paid jobs to. Only `localhost`, `127.0.0.1` or `[::1]` unless `remote_handler = true`, so a typo can't send buyers' inputs elsewhere |
 | `max_jobs` | jobs this offer takes at once, quoted or paid and not yet delivered, default 1. A request beyond it is declined as busy, before anyone pays |
+| `quote_handler` | the URL that prices each request, under the same rule as `handler`. Without one, every request is quoted at `price_lepta` |
 
 Where the offers come from:
 
@@ -33,7 +35,7 @@ Either way, the server advertises the offers when it starts, and again after a r
 
 ## A job
 
-1. A buyer's request arrives. If the offer has room under `max_jobs`, the server quotes it at the offer's price and deadline. If not, it declines with "busy, try again later".
+1. A buyer's request arrives. If the offer has room under `max_jobs`, the server quotes it at the offer's price, or the one its quote handler sets, and at its delivery window. If not, it declines with "busy, try again later".
 2. The buyer pays into escrow. Once the payment lands, the server POSTs the job to the handler.
 3. The handler answers, and the server records the delivery in escrow, keeping the output first.
 4. The follow-through sends the result once the delivery lands, then claims.
@@ -66,6 +68,35 @@ Content-Type: application/json
 | an output too big for a chat message, an answer that can't be read, or a redirect | declines |
 
 The same job can reach the handler twice, after a retry or a restart. `job` stays the same, so the handler can return its earlier output.
+
+## The quote handler
+
+Before quoting a request, the server asks the offer's quote handler, if it has one, what the request costs. It waits at most 15 seconds, since quoting holds up the pass.
+
+```http
+POST /quote
+Content-Type: application/json
+
+{"job": "<id>", "service_id": "acme/summarize/v1", "input": {"text": "..."}, "price_lepta": "1000000"}
+```
+
+`price_lepta` is the offer's own price, for a handler that adjusts it. The answer is the price, and a delivery window in seconds if it isn't the offer's:
+
+```http
+200 OK
+Content-Type: application/json
+
+{"price_lepta": "2500000", "deliver_within_s": 600}
+```
+
+| Answer | What the server does |
+| --- | --- |
+| `200` with a price | quotes it, at the window given or the offer's |
+| `4xx` or a redirect | turns the request away, with the response body as the reason |
+| a price that isn't a whole number of lepta above zero | turns the request away, as one the provider couldn't price |
+| `5xx`, a timeout or no connection | leaves the request for the next pass. The offer's other requests wait too, so a handler that's down costs one timeout a pass |
+
+The same request can reach the quote handler more than once, after it failed for now. The agent's own `service_quote` asks it too, for an offer that has one.
 
 ## What it builds on
 

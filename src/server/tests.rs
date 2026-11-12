@@ -4276,6 +4276,7 @@ fn spec(handler: Option<&str>, max_jobs: u32) -> crate::provider::OfferSpec {
         deliver_within_s: 600,
         escrow_account: None,
         handler: handler.map(str::to_string),
+        quote_handler: None,
         max_jobs,
         remote_handler: false,
     }
@@ -4651,4 +4652,143 @@ async fn a_handler_finishing_after_services_went_off_keeps_its_output_for_later(
     );
     let kept = std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
     assert!(kept.contains("\"done\""), "{kept}");
+}
+
+fn priced_spec(handler: &str, quote: &str) -> crate::provider::OfferSpec {
+    let mut s = spec(Some(handler), 1);
+    s.quote_handler = Some(quote.into());
+    s
+}
+
+#[tokio::test]
+async fn a_quote_handler_sets_the_price_a_request_is_quoted_at() {
+    let (quote, asked) = handler(vec![(
+        "200 OK",
+        r#"{"price_lepta": "2500000", "deliver_within_s": 120}"#,
+    )]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&priced_spec("http://127.0.0.1:9/run", &quote))
+        .await
+        .unwrap();
+    assert_eq!(s.follow_through().await, [format!("service_quote {JOB}")]);
+    let quoted = sent(&fake.calls_to("chat_module.send_message")[0]);
+    match quoted.body {
+        Body::Quote {
+            price_lepta,
+            deliver_within_s,
+            ..
+        } => {
+            assert_eq!(price_lepta, "2500000");
+            assert_eq!(deliver_within_s, 120);
+        }
+        other => panic!("{other:?}"),
+    }
+    let asked: Value = serde_json::from_str(&asked.lock().unwrap()[0]).unwrap();
+    assert_eq!(asked["input"], json!({ "text": "summarise this" }));
+}
+
+#[tokio::test]
+async fn a_quote_handler_that_declines_turns_the_request_away() {
+    let (quote, _asked) = handler(vec![("422 Unprocessable Entity", "too long to summarise")]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&priced_spec("http://127.0.0.1:9/run", &quote))
+        .await
+        .unwrap();
+    assert_eq!(s.follow_through().await, [format!("service_reject {JOB}")]);
+    let told = sent(&fake.calls_to("chat_module.send_message")[0]);
+    assert!(
+        matches!(&told.body, Body::Reject { reason } if reason == "too long to summarise"),
+        "{told:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_quote_handler_that_fails_for_now_leaves_the_request_for_later() {
+    let (quote, _asked) = handler(vec![("503 Service Unavailable", "")]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&priced_spec("http://127.0.0.1:9/run", &quote))
+        .await
+        .unwrap();
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn a_quote_handler_that_is_down_is_asked_once_a_pass() {
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+    let (quote, asked) = handler(vec![
+        ("503 Service Unavailable", ""),
+        ("503 Service Unavailable", ""),
+    ]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text()), (false, &other_request(OTHER))]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let mut offer = priced_spec("http://127.0.0.1:9/run", &quote);
+    offer.max_jobs = 5;
+    s.offer_spec(&offer).await.unwrap();
+    assert!(s.follow_through().await.is_empty());
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn a_quoted_price_goes_out_in_its_plain_form() {
+    let (quote, _asked) = handler(vec![(
+        "200 OK",
+        r#"{"price_lepta": "0000000000000000000000000000000000000005"}"#,
+    )]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&priced_spec("http://127.0.0.1:9/run", &quote))
+        .await
+        .unwrap();
+    s.follow_through().await;
+    let quoted = sent(&fake.calls_to("chat_module.send_message")[0]);
+    assert!(
+        matches!(&quoted.body, Body::Quote { price_lepta, .. } if price_lepta == "5"),
+        "{quoted:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_agents_own_quote_asks_the_quote_handler_too() {
+    let (quote, _asked) = handler(vec![("200 OK", r#"{"price_lepta": "2500000"}"#)]);
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&priced_spec("http://127.0.0.1:9/run", &quote))
+        .await
+        .unwrap();
+    let r = s.service_quote(job(JOB)).await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    let quoted = sent(&fake.calls_to("chat_module.send_message")[0]);
+    assert!(
+        matches!(&quoted.body, Body::Quote { price_lepta, .. } if price_lepta == "2500000"),
+        "{quoted:?}"
+    );
 }
