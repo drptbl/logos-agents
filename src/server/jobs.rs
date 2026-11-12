@@ -15,15 +15,32 @@ use crate::protocol::{self, Body, Job, Payload, Role, State};
 /// so a payment the user approves late still lands within it.
 const QUOTE_VALID_MS: u64 = 30 * 60 * 1000;
 const DELIVER_WITHIN_S: u64 = 10 * 60;
+/// How long a handler that failed for now is left before it's asked again,
+/// doubling up to `RETRY_MAX`.
+const RETRY_FIRST: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long an offer that failed to advertise waits before the next try.
+const OFFERS_RETRY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(30)
+};
+/// The time a handler leaves for its answer to be delivered, on top of the
+/// deadline's margin.
+const DELIVER_SLACK_MS: u64 = 60 * 1000;
+/// The reason a full offer gives the buyer.
+const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Room kept in a chat message for the protocol fields around a text input or output.
 const ENVELOPE_BYTES: usize = 1024;
 /// Kept between an escrow deadline and the calls that race it: the chain
 /// checks block timestamps, seen 138 s behind, and a refused call costs its
 /// whole fee.
 const DEADLINE_MARGIN_MS: u64 = 5 * 60 * 1000;
-/// The longest delivery window an offer may promise, and an escrow quote may
-/// lock a buyer's money for beyond its own life.
-const MAX_DELIVER_S: u64 = 24 * 60 * 60;
+use crate::provider::MAX_DELIVER_S;
 /// Next to the wallet: payments sent, or maybe sent, before the provider was told.
 const PAYMENTS: &str = "service-payments.json";
 /// Next to the wallet: the output of each recorded delivery, kept until the
@@ -31,7 +48,7 @@ const PAYMENTS: &str = "service-payments.json";
 const RESULTS: &str = "service-results.json";
 
 /// What the follow-through does, for the agent.
-const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, and only quotes, works or declines jobs for an offer with a handler, which runs on its own. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// Held by the one server running this wallet's services.
@@ -51,6 +68,18 @@ struct Offer {
     /// The agent account escrow pays and that pays the escrow fees, when
     /// quotes offer escrow.
     escrow_account: Option<String>,
+    /// Set when the offer runs on its own: see `docs/providers.md`.
+    auto: Option<Auto>,
+    /// Set from an offers file or the Basecamp app, which manage it, rather
+    /// than by the agent with `service_offer`.
+    from_spec: bool,
+}
+
+/// What runs an offer with no agent: its handler, and how many jobs it takes at once.
+#[derive(Debug, Clone)]
+struct Auto {
+    handler: String,
+    max_jobs: u32,
 }
 
 /// A payment sent, or maybe sent, before the provider was told about it.
@@ -276,6 +305,11 @@ pub(super) struct Services {
     /// A plain mutex, so a call's guard can free its job when the call is
     /// dropped midway, as a cancelled request is.
     pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Jobs whose handler is running, one task per job: job -> service id.
+    pub(super) running: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    /// The handlers of offers since stopped or replaced: their paid jobs
+    /// still get done.
+    retired: BTreeMap<String, Auto>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -391,6 +425,45 @@ impl Drop for Busy {
     }
 }
 
+/// A job's handler, marked running until this is dropped. An offer runs at
+/// most its `max_jobs` handlers at once.
+struct Running {
+    map: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    job: String,
+}
+
+impl Running {
+    fn claim(
+        map: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+        job: &str,
+        service: &str,
+        max_jobs: u32,
+    ) -> Option<Self> {
+        let claimed = {
+            let mut running = map.lock().unwrap_or_else(|e| e.into_inner());
+            let busy = running.values().filter(|s| *s == service).count();
+            let free = !running.contains_key(job) && busy < max_jobs as usize;
+            if free {
+                running.insert(job.to_string(), service.to_string());
+            }
+            free
+        };
+        claimed.then(|| Self {
+            map,
+            job: job.to_string(),
+        })
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job);
+    }
+}
+
 /// A job and the conversation that carries it.
 struct Found {
     convo: String,
@@ -467,6 +540,14 @@ pub struct CancelParams {
 /// timestamps that lag. An escrow opened now would leave no time either.
 pub(super) fn too_late_for(deadline: u64) -> bool {
     now_ms().saturating_add(DEADLINE_MARGIN_MS) >= deadline
+}
+
+/// How long a handler may take for a job due at `deadline`: up to the
+/// deadline's margin, less the time its answer needs to be delivered.
+fn handler_time_left(deadline: u64) -> u64 {
+    deadline
+        .saturating_sub(DEADLINE_MARGIN_MS + DELIVER_SLACK_MS)
+        .saturating_sub(now_ms())
 }
 
 fn now_ms() -> u64 {
@@ -1035,8 +1116,9 @@ impl AgentServer {
 
     /// One pass over every job, taking the steps that only waited on the
     /// chain: telling the provider once a payment lands, sending a recorded
-    /// result, claiming and refunding. It never pays, quotes, delivers new
-    /// work or declines. Returns what it did, as `tool job` lines.
+    /// result, claiming and refunding. It never pays, and only quotes, works
+    /// or declines jobs for an offer with a handler. Returns what it did, as
+    /// `tool job` lines.
     pub(super) async fn follow_through(&self) -> Vec<String> {
         let mut done = Vec::new();
         if !self.follows_through() {
@@ -1060,10 +1142,39 @@ impl AgentServer {
             *seen.entry(f.job.job.clone()).or_default() += 1;
         }
         let notes = self.with_payments().await.submitted.clone();
-        let (pending, settled) = {
+        let (pending, settled, offers, retired) = {
             let state = self.services.lock().await;
-            (state.pending.clone(), state.settled.clone())
+            (
+                state.pending.clone(),
+                state.settled.clone(),
+                state.offers.clone(),
+                state.retired.clone(),
+            )
         };
+        // What each offer has taken: quotes still open, and handlers at work.
+        // A payment only claimed in chat takes nothing until a handler runs.
+        let now = now_ms();
+        let mut taken = BTreeMap::<String, u32>::new();
+        for f in &jobs {
+            let open = f.job.role == Role::Provider
+                && f.job.state == State::Quoted
+                && !settled.contains(&f.job.job)
+                && f.job.quote.as_ref().is_some_and(|q| q.expires_at > now);
+            if open {
+                *taken.entry(f.job.service.clone()).or_default() += 1;
+            }
+        }
+        for service in self
+            .services
+            .lock()
+            .await
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            *taken.entry(service.clone()).or_default() += 1;
+        }
         for found in jobs {
             // The user can switch the tools off while a pass runs.
             if !self.follows_through() {
@@ -1073,9 +1184,28 @@ impl AgentServer {
             if seen[&id] > 1 || settled.contains(&id) {
                 continue;
             }
-            let step = self
-                .follow_through_job(&found, notes.get(&id), pending.contains_key(&id))
-                .await;
+            // An offer that runs on its own quotes requests and works paid jobs itself.
+            // A paid job keeps the handler of an offer stopped or replaced since.
+            let auto = offers
+                .get(&found.job.service)
+                .and_then(|o| o.auto.clone())
+                .or_else(|| {
+                    (found.job.state == State::Paid)
+                        .then(|| retired.get(&found.job.service).cloned())
+                        .flatten()
+                })
+                .filter(|_| found.job.role == Role::Provider);
+            let provided = match &auto {
+                Some(auto) => self.provide(&found, auto, &mut taken).await,
+                None => Ok(None),
+            };
+            let step = match provided {
+                Ok(None) => {
+                    self.follow_through_job(&found, notes.get(&id), pending.contains_key(&id))
+                        .await
+                }
+                other => other,
+            };
             match step {
                 Ok(Some((tool, v))) => {
                     tracing::info!(job = %id, "follow-through: {tool}");
@@ -1092,6 +1222,228 @@ impl AgentServer {
             }
         }
         done
+    }
+
+    /// The provider's step for a job on an offer that runs on its own: quote a
+    /// request it has room for, decline one it hasn't, and start the handler
+    /// for a paid job.
+    async fn provide(
+        &self,
+        found: &Found,
+        auto: &Auto,
+        taken: &mut BTreeMap<String, u32>,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let Found { can_send, job, .. } = found;
+        if !*can_send {
+            return Ok(None);
+        }
+        match job.state {
+            State::Requested => {
+                let held = taken.entry(job.service.clone()).or_default();
+                if *held >= auto.max_jobs {
+                    let v = self.reject_job(&job.job, BUSY).await?;
+                    return Ok(Some(("service_reject", v)));
+                }
+                let v = tool_json(
+                    self.service_quote(Parameters(JobParams {
+                        job: job.job.clone(),
+                    }))
+                    .await,
+                )?;
+                *held += 1;
+                Ok(Some(("service_quote", v)))
+            }
+            State::Paid => self.start_handler(job, auto).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// Start the handler for a job paid on its quote's terms, unless one runs
+    /// for it already or a delivery may still land. Too late to deliver, the
+    /// job is declined instead, so the buyer gets the money back.
+    async fn start_handler(
+        &self,
+        job: &Job,
+        auto: &Auto,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let map = self.services.lock().await.running.clone();
+        if map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&job.job)
+        {
+            return Ok(None);
+        }
+        let q = job.quote.as_ref().ok_or("the job has no quote")?;
+        let deadline = q
+            .expires_at
+            .saturating_add(q.deliver_within_s.saturating_mul(1000));
+        match job.escrow_buyer.as_deref() {
+            Some(buyer) => {
+                let Some(e) = escrow_job(job, buyer)? else {
+                    return Ok(None);
+                };
+                match self.escrow_record(&e).await? {
+                    Some(r) if e.holds(&r) && r.state == JobState::Open => {}
+                    _ => return Ok(None),
+                }
+                if self.in_flight_recent(&job.job).await {
+                    return Ok(None);
+                }
+            }
+            None => {
+                if !self.paid_on_chain(job).await {
+                    return Ok(None);
+                }
+            }
+        }
+        if too_late_for(deadline) {
+            let v = self
+                .reject_job(&job.job, "too late to deliver before the deadline")
+                .await?;
+            return Ok(Some(("service_reject", v)));
+        }
+        // Paid jobs wait while the offer's handlers are all at work.
+        let Some(running) = Running::claim(map, &job.job, &job.service, auto.max_jobs) else {
+            return Ok(None);
+        };
+        let kept = self.saved_result(&job.job).await?;
+        let server = self.clone();
+        let (job, auto) = (job.clone(), auto.clone());
+        tokio::spawn(async move {
+            let _running = running;
+            server.run_handler(job, auto, deadline, kept).await;
+        });
+        Ok(None)
+    }
+
+    /// Ask the handler for a job's output, again while it fails for now and
+    /// there's time, then deliver it or decline the job. An output kept from
+    /// before is delivered without asking again.
+    async fn run_handler(&self, job: Job, auto: Auto, deadline: u64, kept: Option<Payload>) {
+        use crate::provider::{Answer, HandlerRequest, call_handler};
+        let mut wait = RETRY_FIRST;
+        let answer = loop {
+            if let Some(output) = &kept {
+                break Answer::Output(output.clone());
+            }
+            let left = handler_time_left(deadline);
+            if left < 1000 {
+                break Answer::Declined("the handler didn't finish in time".into());
+            }
+            let (url, id, service, input, price) = (
+                auto.handler.clone(),
+                job.job.clone(),
+                job.service.clone(),
+                job.input.clone(),
+                job.quote
+                    .as_ref()
+                    .map(|q| q.price_lepta.clone())
+                    .unwrap_or_default(),
+            );
+            let answer = tokio::task::spawn_blocking(move || {
+                let asked = HandlerRequest {
+                    job: &id,
+                    service_id: &service,
+                    input: &input,
+                    price_lepta: &price,
+                    deadline_ms: deadline,
+                };
+                call_handler(&url, &asked, std::time::Duration::from_millis(left))
+            })
+            .await
+            .unwrap_or_else(|e| Answer::Retry(e.to_string()));
+            match answer {
+                Answer::Retry(e) => {
+                    tracing::warn!(job = %job.job, "handler failed for now: {e}");
+                    let left = handler_time_left(deadline);
+                    if u128::from(left) < wait.as_millis() + 1000 {
+                        break Answer::Declined("the handler didn't finish in time".into());
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RETRY_MAX);
+                }
+                other => break other,
+            }
+        };
+        // The user may have switched the tools off while the handler worked:
+        // act on nothing now, and keep an output for when they're back on.
+        if !self.follows_through() {
+            if let Answer::Output(output) = &answer
+                && let Err(e) = self.save_result(&job.job, Some(output)).await
+            {
+                tracing::warn!(job = %job.job, "can't keep the handler's output: {e}");
+            }
+            tracing::info!(job = %job.job, "provider: services are off, the job waits");
+            return;
+        }
+        let (tool, result) = match answer {
+            Answer::Output(output) => {
+                let (output_text, output_cid) = match output {
+                    Payload::Text(t) => (Some(t), None),
+                    Payload::Cid(c) => (None, Some(c)),
+                };
+                // An output that can't go out is the handler's: decline, so the
+                // buyer gets the money back.
+                match payload(output_text.clone(), output_cid.clone(), "output") {
+                    Ok(_) => {
+                        let p = DeliverParams {
+                            job: job.job.clone(),
+                            output_text,
+                            output_cid,
+                        };
+                        (
+                            "service_deliver",
+                            self.one_at_a_time(&job.job, self.deliver(p)).await,
+                        )
+                    }
+                    Err(e) => (
+                        "service_reject",
+                        self.reject_job(
+                            &job.job,
+                            &format!("the handler's output can't be delivered: {e}"),
+                        )
+                        .await,
+                    ),
+                }
+            }
+            Answer::Declined(reason) => {
+                ("service_reject", self.reject_job(&job.job, &reason).await)
+            }
+            Answer::Retry(_) => unreachable!("retries loop until an answer or a decline"),
+        };
+        match &result {
+            Ok(v) => {
+                tracing::info!(job = %job.job, "provider: {tool}");
+                self.base.record_activity(
+                    &format!("auto:{tool}"),
+                    &json!({ "job": job.job }),
+                    true,
+                    &v.to_string(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(job = %job.job, "provider: {tool} failed: {e}");
+                self.base.record_activity(
+                    &format!("auto:{tool}"),
+                    &json!({ "job": job.job }),
+                    false,
+                    e,
+                );
+            }
+        }
+    }
+
+    /// Decline a job, giving `reason`: before payment the buyer is told, and
+    /// after it the escrow is returned so they can take their money back.
+    async fn reject_job(&self, job: &str, reason: &str) -> Result<Value, String> {
+        tool_json(
+            self.service_reject(Parameters(RejectParams {
+                job: job.to_string(),
+                reason: reason.to_string(),
+            }))
+            .await,
+        )
     }
 
     /// Whether the switches let the follow-through act.
@@ -1248,18 +1600,112 @@ impl AgentServer {
         &self,
         Parameters(p): Parameters<OfferParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = self.needs(&["chat", "discovery", "wallet"]) {
-            return fail(e);
+        match self.offer(p, None, false).await {
+            Ok(v) => ok(v),
+            Err(e) => fail(e),
         }
+    }
+
+    /// Advertise an offer from an offers file or the Basecamp app: one with a
+    /// handler runs on its own.
+    pub async fn offer_spec(&self, spec: &crate::provider::OfferSpec) -> Result<Value, String> {
+        let p = OfferParams {
+            service_id: spec.service_id.clone(),
+            tag: spec.tag.clone(),
+            price_lepta: spec.price_lepta.clone(),
+            deliver_within_s: Some(spec.deliver_within_s),
+            escrow: None,
+            escrow_account: spec.escrow_account.clone(),
+        };
+        let auto = spec.handler.clone().map(|handler| Auto {
+            handler,
+            max_jobs: spec.max_jobs,
+        });
+        self.offer(p, auto, true).await
+    }
+
+    /// Apply `offers`, trying again every `OFFERS_RETRY` while any fails to
+    /// advertise, as chat or discovery may not be up yet. Each try first asks
+    /// `wanted` whether these are still the offers to run. `applied` hears what
+    /// became of each, by service id, after every try, and returns false to stop.
+    pub async fn keep_offers(
+        &self,
+        offers: &[crate::provider::OfferSpec],
+        wanted: impl Fn() -> bool,
+        mut applied: impl FnMut(&Value) -> bool,
+    ) {
+        loop {
+            // One set at a time, and only while it's still the one wanted.
+            let held = self.applying.lock().await;
+            if !wanted() {
+                return;
+            }
+            let results = self.apply_offers(offers).await;
+            drop(held);
+            let failed = results
+                .as_object()
+                .is_some_and(|all| all.values().any(|r| r.get("error").is_some()));
+            if !applied(&results) || !failed {
+                return;
+            }
+            tokio::time::sleep(OFFERS_RETRY).await;
+        }
+    }
+
+    /// Make this server's offers match `wanted`: stop the ones no longer
+    /// there and advertise the rest. Says what happened to each, by service id.
+    pub async fn apply_offers(&self, wanted: &[crate::provider::OfferSpec]) -> Value {
+        // Only the offers a file or the app set: the agent's own stay as they are.
+        let current: Vec<String> = self
+            .services
+            .lock()
+            .await
+            .offers
+            .iter()
+            .filter(|(_, o)| o.from_spec)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut results = serde_json::Map::new();
+        for id in current
+            .into_iter()
+            .filter(|id| !wanted.iter().any(|w| w.service_id == *id))
+        {
+            let stopped = tool_json(
+                self.service_stop(Parameters(ServiceParams {
+                    service_id: id.clone(),
+                }))
+                .await,
+            );
+            let result = match stopped {
+                Ok(_) => json!({ "stopped": true }),
+                Err(e) => json!({ "error": e }),
+            };
+            results.insert(id, result);
+        }
+        for spec in wanted {
+            let result = match self.offer_spec(spec).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e }),
+            };
+            results.insert(spec.service_id.clone(), result);
+        }
+        Value::Object(results)
+    }
+
+    async fn offer(
+        &self,
+        p: OfferParams,
+        auto: Option<Auto>,
+        from_spec: bool,
+    ) -> Result<Value, String> {
+        self.needs(&["chat", "discovery", "wallet"])?;
         // Another server running this wallet's services would get the requests.
         if let Err(e) = self.hold_wallet().await {
-            return fail(e.to_string());
+            return Err(e.to_string());
         }
-        if let Err(e) = guard::validate_service_id(&p.service_id) {
-            return fail(e);
-        }
+        guard::validate_service_id(&p.service_id)?;
         if p.tag.len() > guard::MAX_AD_TAG_BYTES {
-            return fail(format!(
+            return Err(format!(
                 "tag is {} bytes; discovery allows at most {}",
                 p.tag.len(),
                 guard::MAX_AD_TAG_BYTES
@@ -1268,28 +1714,30 @@ impl AgentServer {
         if guard::amount_le16_hex(&p.price_lepta).is_err()
             || p.price_lepta.trim_start_matches('0').is_empty()
         {
-            return fail("price_lepta must be a whole number of lepta above zero, as digits");
+            return Err(String::from(
+                "price_lepta must be a whole number of lepta above zero, as digits",
+            ));
         }
         let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
         if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
-            return fail(format!(
+            return Err(format!(
                 "deliver_within_s must be between 1 and {MAX_DELIVER_S} seconds"
             ));
         }
         if let Err(e) = self.base.wallet() {
-            return fail(format!("services are paid into the agent wallet: {e}"));
+            return Err(format!("services are paid into the agent wallet: {e}"));
         }
         let escrow_account = if p.escrow == Some(false) {
             None
         } else {
             match self.escrow_account(p.escrow_account.as_deref()).await {
                 Ok(account) => Some(account),
-                Err(e) => return fail(e),
+                Err(e) => return Err(e),
             }
         };
         let address = match self.base.ensure_chat().await {
             Ok((address, _)) => address,
-            Err(e) => return fail(e),
+            Err(e) => return Err(e),
         };
         let _advertising = self.advertising.lock().await;
         let (replacing, others) = {
@@ -1302,11 +1750,22 @@ impl AgentServer {
             .await
         {
             Ok(id) => id,
-            Err(e) => return fail(e),
+            Err(e) => return Err(e),
         };
         {
             let mut state = self.services.lock().await;
             state.advertised.insert(p.service_id.clone());
+            // A replaced handler keeps working its paid jobs; a revived one is live again.
+            let replaced = state.offers.get(&p.service_id).and_then(|o| o.auto.clone());
+            match (&auto, replaced) {
+                (Some(_), _) => {
+                    state.retired.remove(&p.service_id);
+                }
+                (None, Some(old)) => {
+                    state.retired.insert(p.service_id.clone(), old);
+                }
+                (None, None) => {}
+            }
             state.offers.insert(
                 p.service_id.clone(),
                 Offer {
@@ -1315,6 +1774,8 @@ impl AgentServer {
                     deliver_within_s,
                     advertised_to: address.clone(),
                     escrow_account: escrow_account.clone(),
+                    auto: auto.clone(),
+                    from_spec,
                 },
             );
         }
@@ -1323,7 +1784,7 @@ impl AgentServer {
         let warning = others.then_some(
             "this node already advertised another service, and libp2p_module 1.1.0 only lets a node be found for the first service it advertises: buyers may not find this one until the libp2p module restarts",
         );
-        ok(json!({
+        Ok(json!({
             "warning": warning,
             "service_id": p.service_id,
             "tag": p.tag,
@@ -1386,7 +1847,13 @@ impl AgentServer {
             return fail(e);
         }
         let _advertising = self.advertising.lock().await;
-        self.services.lock().await.offers.remove(&p.service_id);
+        {
+            // A stopped offer's paid jobs still get done.
+            let mut state = self.services.lock().await;
+            if let Some(auto) = state.offers.remove(&p.service_id).and_then(|o| o.auto) {
+                state.retired.insert(p.service_id.clone(), auto);
+            }
+        }
         match self
             .base
             .node()

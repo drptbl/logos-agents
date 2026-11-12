@@ -8,6 +8,8 @@ class LogosAgentsApp
     PROP(QString wallet="{}" READONLY)
     // Transfers waiting for the user's approval.
     PROP(QString approvals="{}" READONLY)
+    // The offers the module runs, and what became of each when last applied.
+    PROP(QString offers="{}" READONLY)
     SLOT(QString token())
     SLOT(QString rotateToken())
     SLOT(QString setPermission(QString group, bool enabled))
@@ -16,4 +18,6 @@ class LogosAgentsApp
     SLOT(void refreshWallet())
     SLOT(QString approve(QString requestId))
     SLOT(QString deny(QString requestId))
+    SLOT(QString saveOffers(QString offers))
+    SLOT(void refreshOffers())
 }

@@ -9,6 +9,7 @@ include!(concat!(
 
 use std::{path::PathBuf, sync::Arc};
 
+use logos_agents::provider::{self, OfferSpec};
 use logos_agents::server::AgentServer;
 use logos_mcp::{
     events::EventStore,
@@ -128,6 +129,20 @@ static CONTROL: std::sync::OnceLock<Control> = std::sync::OnceLock::new();
 /// share the server's wallet lock and state, so the app and agents never race.
 static WALLET: std::sync::OnceLock<(LogosServer, tokio::runtime::Handle)> =
     std::sync::OnceLock::new();
+/// The agent server and its runtime, for the app's offers.
+static AGENTS: std::sync::OnceLock<(AgentServer, tokio::runtime::Handle)> =
+    std::sync::OnceLock::new();
+/// Where the offers the app sets are kept, in the module's data folder.
+static OFFERS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// Bumped each time the app sets offers, so an older retry gives way.
+static OFFERS_SET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Held while the app's offers are saved and applied: one save at a time,
+/// since the file is written through one temporary name.
+static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// What became of each offer the last time they were applied, by service id.
+static OFFERS_APPLIED: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+const OFFERS_FILE: &str = "offers.toml";
+
 /// Why the endpoint isn't serving, when it isn't.
 static ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
@@ -163,6 +178,8 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
     let for_wallet = server.clone();
     let agents = AgentServer::new(server);
     let following = agents.clone();
+    let offering = agents.clone();
+    let _ = OFFERS_PATH.set(data_dir.join(OFFERS_FILE));
     let app = router(move || Ok(agents.clone()), control.tokens());
 
     let stop = STOP
@@ -179,6 +196,7 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
             Err(e) => return tx.send(Err(e.to_string())).unwrap_or(()),
         };
         let _ = WALLET.set((for_wallet, rt.handle().clone()));
+        let _ = AGENTS.set((offering.clone(), rt.handle().clone()));
         // A panic in the serving loop must reach `status` too, not just end the thread.
         let serving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async move {
@@ -194,6 +212,14 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
                 // Jobs are followed through while the module runs, with or
                 // without a client connected.
                 following.start_follow_through();
+                // The offers the app set run again, until each is advertised.
+                match saved_offers() {
+                    Ok(offers) if !offers.is_empty() => {
+                        tokio::spawn(keep_offers(offering, offers, 0));
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("logos_agents: offers not started: {e}"),
+                }
                 let served = axum::serve(listener, app)
                     .with_graceful_shutdown(stop.clone().cancelled_owned())
                     .await;
@@ -217,6 +243,34 @@ fn start(data_dir: PathBuf) -> Result<(), String> {
         node.watch(module, events.clone());
     }
     Ok(())
+}
+
+/// The offers the app saved, none when it hasn't.
+fn saved_offers() -> Result<Vec<OfferSpec>, String> {
+    let path = OFFERS_PATH.get().ok_or("the data folder was not opened")?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    provider::load_offers(path)
+}
+
+/// Apply `offers` until every one is advertised, or the app sets others.
+async fn keep_offers(server: AgentServer, offers: Vec<OfferSpec>, set: u64) {
+    let current = || OFFERS_SET.load(std::sync::atomic::Ordering::SeqCst) == set;
+    server
+        .keep_offers(&offers, current, |applied| {
+            if let Ok(mut last) = OFFERS_APPLIED.lock() {
+                *last = Some(applied.clone());
+            }
+            current()
+        })
+        .await;
+}
+
+/// The app's offers and what became of them.
+fn offers_view(offers: &[OfferSpec]) -> Value {
+    let applied = OFFERS_APPLIED.lock().ok().and_then(|a| a.clone());
+    json!({ "offers": provider::offers_to_json(offers), "applied": applied })
 }
 
 /// Record why the endpoint isn't serving, for `status` and Basecamp's log.
@@ -360,6 +414,39 @@ impl LogosAgentsModule for ModuleImpl {
 
     fn activity(&self, after: i64) -> String {
         for_app(|c| Ok(c.activity(u64::try_from(after).unwrap_or(0))))
+    }
+
+    fn offers(&self) -> String {
+        for_app(|_| saved_offers().map(|offers| offers_view(&offers)))
+    }
+
+    fn set_offers(&self, offers: String) -> String {
+        for_app(|_| {
+            let offers = provider::offers_from_json(&offers)?;
+            let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+            let path = OFFERS_PATH.get().ok_or("the data folder was not opened")?;
+            logos_mcp::guard::write_private(path, provider::render_offers(&offers).as_bytes())
+                .map_err(|e| format!("can't save {OFFERS_FILE}: {e}"))?;
+            let set = OFFERS_SET.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let (server, runtime) = AGENTS.get().ok_or("the MCP server isn't running")?;
+            // Applied once now, so the app sees the outcome; any that fail are
+            // tried again in the background.
+            let current = || OFFERS_SET.load(std::sync::atomic::Ordering::SeqCst) == set;
+            runtime.block_on(server.keep_offers(&offers, current, |applied| {
+                if let Ok(mut last) = OFFERS_APPLIED.lock() {
+                    *last = Some(applied.clone());
+                }
+                false
+            }));
+            let failed = OFFERS_APPLIED.lock().ok().and_then(|a| a.clone()).is_some_and(|a| {
+                a.as_object()
+                    .is_some_and(|all| all.values().any(|r| r.get("error").is_some()))
+            });
+            if failed {
+                runtime.spawn(keep_offers(server.clone(), offers.clone(), set));
+            }
+            Ok(offers_view(&offers))
+        })
     }
 }
 
