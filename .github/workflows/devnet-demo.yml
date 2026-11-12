@@ -11,6 +11,7 @@ on:
       - .github/workflows/devnet-demo.yml
       - logos-devnet.toml
       - scripts/demo_escrow_job.py
+      - scripts/demo_provider.py
       - scripts/e2e.py
       - scripts/logos-dev-peers.txt
 
@@ -39,6 +40,8 @@ jobs:
       # the escrow and a logosctl session per side.
       - uses: drptbl/logos-devnet@v0.4.0
       - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
+      # A provider that runs on its own: logos-agents provide, with a handler here.
+      - run: python3 scripts/demo_provider.py --timeout 600
       # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
