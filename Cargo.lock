@@ -569,8 +569,8 @@ dependencies = [
 
 [[package]]
 name = "logos-mcp"
-version = "0.6.0"
-source = "git+https://github.com/drptbl/logos-mcp?rev=f29c2d123855b125289bfe5480e12e8955fe2a4e#f29c2d123855b125289bfe5480e12e8955fe2a4e"
+version = "0.6.1"
+source = "git+https://github.com/drptbl/logos-mcp?rev=17f875625bf245b04f04f2c4c7c269ecced3f879#17f875625bf245b04f04f2c4c7c269ecced3f879"
 dependencies = [
  "anyhow",
  "base64",

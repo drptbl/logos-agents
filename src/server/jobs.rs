@@ -23,6 +23,12 @@ const RETRY_FIRST: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(5)
 };
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long an offer that failed to advertise waits before the next try.
+const OFFERS_RETRY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(30)
+};
 /// The reason a full offer gives the buyer.
 const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Room kept in a chat message for the protocol fields around a text input or output.
@@ -1529,6 +1535,26 @@ impl AgentServer {
             max_jobs: spec.max_jobs,
         });
         self.offer(p, auto).await
+    }
+
+    /// Apply `offers`, trying again every `OFFERS_RETRY` while any fails to
+    /// advertise, as chat or discovery may not be up yet. `applied` hears what
+    /// became of each, by service id, after every try, and returns false to stop.
+    pub async fn keep_offers(
+        &self,
+        offers: &[crate::provider::OfferSpec],
+        mut applied: impl FnMut(&Value) -> bool,
+    ) {
+        loop {
+            let results = self.apply_offers(offers).await;
+            let failed = results
+                .as_object()
+                .is_some_and(|all| all.values().any(|r| r.get("error").is_some()));
+            if !applied(&results) || !failed {
+                return;
+            }
+            tokio::time::sleep(OFFERS_RETRY).await;
+        }
     }
 
     /// Make this server's offers match `wanted`: stop the ones no longer

@@ -4467,3 +4467,31 @@ async fn applying_offers_stops_the_dropped_ones_and_advertises_the_rest() {
         "{stopped:?}"
     );
 }
+
+#[tokio::test]
+async fn offers_that_fail_to_advertise_are_tried_again() {
+    let fake = node();
+    // Discovery isn't up at first.
+    fake.reset(
+        "libp2p_module.discoStartAdvertising",
+        RawOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "not started".into(),
+        },
+    );
+    fake.set(
+        "libp2p_module.discoStartAdvertising",
+        p2p("discoStartAdvertising", "null"),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    let mut tries = Vec::new();
+    s.keep_offers(&[spec(None, 1)], |applied| {
+        tries.push(applied.clone());
+        true
+    })
+    .await;
+    assert_eq!(tries.len(), 2, "{tries:?}");
+    assert!(tries[0][SVC].get("error").is_some(), "{tries:?}");
+    assert!(tries[1][SVC].get("error").is_none(), "{tries:?}");
+}
