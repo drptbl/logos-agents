@@ -208,3 +208,36 @@ fn offers_from_the_app_pass_the_same_checks_and_round_trip() {
             .contains("remote_handler")
     );
 }
+
+#[test]
+fn a_redirect_or_an_answer_too_big_declines() {
+    let (url, _served) = stub("302 Found", "");
+    assert!(matches!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Declined(_)
+    ));
+    static BIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            r#"{{"output": {{"text": "{}"}}}}"#,
+            "x".repeat(2 * 1024 * 1024)
+        )
+    });
+    let (url, _served) = stub("200 OK", &BIG);
+    assert!(matches!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Declined(_)
+    ));
+}
+
+#[test]
+fn a_handler_on_this_machine_is_reached_without_a_proxy() {
+    // A proxy set for the process must not carry buyers' inputs off the machine.
+    let (url, _served) = stub("200 OK", r#"{"output": {"text": "a summary"}}"#);
+    let agent = handler_agent(Duration::from_secs(5));
+    assert!(agent.config().proxy().is_none());
+    assert_eq!(agent.config().max_redirects(), 0);
+    assert_eq!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Output(Payload::Text("a summary".into()))
+    );
+}

@@ -183,13 +183,22 @@ struct Done {
     output: Payload,
 }
 
-/// Ask the handler at `url` to do a job, waiting at most `timeout`. Blocking.
-pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> Answer {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// The client for handler requests: no proxy and no redirects, so a request
+/// checked to stay on this machine does, and an answer comes only from the
+/// handler itself.
+fn handler_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(0)
         .build()
-        .into();
+        .into()
+}
+
+/// Ask the handler at `url` to do a job, waiting at most `timeout`. Blocking.
+pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> Answer {
+    let agent = handler_agent(timeout);
     let Ok(body) = serde_json::to_vec(job) else {
         return Answer::Declined("the job couldn't be encoded for the handler".into());
     };
@@ -205,11 +214,15 @@ pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> A
         .limit(MAX_ANSWER_BYTES)
         .read_to_string();
     if status.is_success() {
+        // An answer too big, or not text, would be the same next time.
         return match body.map(|b| serde_json::from_str::<Done>(&b)) {
             Ok(Ok(done)) => Answer::Output(done.output),
             Ok(Err(e)) => Answer::Declined(format!("the handler's answer had no output: {e}")),
-            Err(e) => Answer::Retry(format!("reading the handler's answer failed: {e}")),
+            Err(e) => Answer::Declined(format!("the handler's answer can't be read: {e}")),
         };
+    }
+    if status.is_redirection() {
+        return Answer::Declined(format!("the handler answered with a redirect ({status})"));
     }
     if status.is_client_error() {
         let reason: String = body
