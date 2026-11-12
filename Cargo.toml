@@ -24,7 +24,7 @@ required-features = ["cli"]
 anyhow = { version = "1.0.104", optional = true }
 base64 = "0.23.1"
 getrandom = "0.3"
-logos-mcp = { git = "https://github.com/drptbl/logos-mcp", rev = "17f875625bf245b04f04f2c4c7c269ecced3f879", default-features = false }
+logos-mcp = { git = "https://github.com/drptbl/logos-mcp", rev = "0914fc6e1220ce000282b27b4051f2c417f754e4", default-features = false }
 rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

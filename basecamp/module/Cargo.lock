@@ -708,7 +708,7 @@ dependencies = [
 [[package]]
 name = "logos-mcp"
 version = "0.6.1"
-source = "git+https://github.com/drptbl/logos-mcp?rev=17f875625bf245b04f04f2c4c7c269ecced3f879#17f875625bf245b04f04f2c4c7c269ecced3f879"
+source = "git+https://github.com/drptbl/logos-mcp?rev=0914fc6e1220ce000282b27b4051f2c417f754e4#0914fc6e1220ce000282b27b4051f2c417f754e4"
 dependencies = [
  "anyhow",
  "axum",
