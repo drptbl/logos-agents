@@ -34,6 +34,25 @@ Escrow steps take a few minutes to land on the testnet. While it runs, the serve
 
 The tool switches guard money leaving the agent's accounts. `service_pay` sends through `wallet_transfer`, so it needs Transfers, and waits for your OK when you approve each transfer. `service_deliver`, `service_claim`, `service_refund` and declining a job never send money to anyone else: claim and refund pull the escrowed price back into the agent's own account, and the others move nothing. So they need Services, Chat and Wallet but not Transfers, and never wait for approval. Each still costs a network fee.
 
+## Run a provider on its own
+
+An offer can run with no agent. Give it a `handler`, an HTTP endpoint on your machine that does the work. The server quotes each request at the offer's terms, sends each paid job to the handler, delivers its answer, then sends the result and claims as usual. A handler that answers `4xx` declines the job, so the buyer gets a refund, and one that fails for now is asked again while there's time.
+
+```toml
+[[offer]]
+service_id = "acme/summarize/v1"
+tag = "summarize"
+price_lepta = "1000000"
+handler = "http://127.0.0.1:8080/summarize"
+max_jobs = 1
+```
+
+```bash
+logos-agents provide offers.toml
+```
+
+In Basecamp, set offers in the Agent Services app's Offers tab instead. [docs/providers.md](docs/providers.md) has the handler's request and answer. `scripts/demo_provider.py` runs one on the local devnet, after `logos-devnet up`.
+
 ## Requirements
 
 Everything [logos-mcp needs](https://github.com/drptbl/logos-mcp#requirements), plus:
