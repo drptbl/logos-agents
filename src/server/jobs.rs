@@ -2254,23 +2254,21 @@ impl AgentServer {
             }
             None => (q.pay_to.clone(), None),
         };
-        // An escrow payment is noted before it is asked for, so a restart
-        // can't lose which account it goes from: without that, no open. An
-        // earlier note, from an open with no clear outcome, outlives this try.
+        // Noted before it is asked for, as may have gone out: a call stopped
+        // mid-send can't then pay again, and an escrow payment keeps the
+        // account it goes from, without which no refund. An earlier note,
+        // from an open with no clear outcome, outlives this try.
         let earlier = self.with_payments().await.submitted.get(&p.job).cloned();
-        if escrow.is_some()
-            && let Err(e) = self
-                .save_payment(
-                    &p.job,
-                    Some(Payment::Escrow {
-                        tx_hash: None,
-                        escrow_buyer: p.from.clone(),
-                    }),
-                )
-                .await
-        {
+        let noted = match &escrow {
+            Some(_) => Payment::Escrow {
+                tx_hash: None,
+                escrow_buyer: p.from.clone(),
+            },
+            None => Payment::Transfer(None),
+        };
+        if let Err(e) = self.save_payment(&p.job, Some(noted)).await {
             return Err(format!(
-                "can't save which account pays, so a restart could lose the refund: not opening the escrow ({e})"
+                "can't save the payment before sending it, so a restart could pay twice or lose the refund: not paying ({e})"
             ));
         }
         let sent = tool_json(
@@ -2290,14 +2288,9 @@ impl AgentServer {
             Ok(sent) => sent,
             Err(e) => {
                 let maybe = e.contains("may have been sent") || e.contains("may be sent");
-                match (&escrow, maybe) {
-                    (None, true) => {
-                        self.note_payment(&p.job, Some(Payment::Transfer(None)))
-                            .await;
-                    }
-                    // Nothing went out this time.
-                    (Some(_), false) => self.note_payment(&p.job, earlier).await,
-                    _ => {}
+                // Nothing went out this time: back to the earlier note, if any.
+                if !maybe {
+                    self.note_payment(&p.job, earlier).await;
                 }
                 return Err(e);
             }
@@ -2322,6 +2315,11 @@ impl AgentServer {
             self.note_payment(&p.job, Some(Payment::Transfer(Some(tx.clone()))))
                 .await;
             return self.tell_paid(&convo, &job.job, tell(tx, None)).await;
+        }
+        // Waiting for the user: nothing went out yet. An escrow payment keeps
+        // its note; a transfer is followed through its request instead.
+        if escrow.is_none() {
+            self.note_payment(&p.job, earlier).await;
         }
         let request_id = sent["request_id"].as_str().unwrap_or_default().to_string();
         self.services
