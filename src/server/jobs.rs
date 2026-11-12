@@ -1734,6 +1734,18 @@ impl AgentServer {
                         result: hash,
                         deadline: e.deadline,
                     };
+                    // An earlier delivery may still land, and then its own output
+                    // must go out: don't keep another in its place.
+                    if self.in_flight_recent(&job.job).await
+                        && self
+                            .saved_result(&job.job)
+                            .await?
+                            .is_some_and(|o| o != kept)
+                    {
+                        return Err(
+                            "an earlier delivery with another output may still land: send the same output, or check service_jobs in a few minutes".into(),
+                        );
+                    }
                     // Kept before it is recorded: a delivery with no clear
                     // answer may still land, and then this output goes out.
                     self.save_result(&job.job, Some(&kept))
