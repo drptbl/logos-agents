@@ -271,7 +271,9 @@ pub(super) struct Services {
     pub(super) pending: BTreeMap<String, String>,
     /// Jobs a call is paying, cancelling, delivering, claiming or refunding
     /// right now: one at a time per job.
-    pub(super) busy: BTreeSet<String>,
+    /// A plain mutex, so a call's guard can free its job when the call is
+    /// dropped midway, as a cancelled request is.
+    pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -292,6 +294,35 @@ pub(super) struct Services {
     pub(super) settled: BTreeSet<String>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
+}
+
+/// A job marked busy until this is dropped: when the call finishes, fails or
+/// is dropped midway.
+struct Busy {
+    set: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    job: String,
+}
+
+impl Busy {
+    fn claim(set: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>, job: &str) -> Option<Self> {
+        let claimed = set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job.to_string());
+        claimed.then(|| Self {
+            set,
+            job: job.to_string(),
+        })
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job);
+    }
 }
 
 /// A job and the conversation that carries it.
@@ -2189,19 +2220,18 @@ impl AgentServer {
     }
 
     /// Run `work` on `job` unless another call is working on that job.
-    async fn one_at_a_time<T>(
+    pub(super) async fn one_at_a_time<T>(
         &self,
         job: &str,
         work: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
-        if !self.services.lock().await.busy.insert(job.to_string()) {
+        let set = self.services.lock().await.busy.clone();
+        let Some(_held) = Busy::claim(set, job) else {
             return Err(format!(
                 "another call is working on job {job}: try again shortly"
             ));
-        }
-        let result = work.await;
-        self.services.lock().await.busy.remove(job);
-        result
+        };
+        work.await
     }
 
     async fn cancel(&self, p: CancelParams) -> Result<Value, String> {

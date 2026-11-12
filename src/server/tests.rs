@@ -1681,7 +1681,13 @@ async fn a_job_being_paid_cannot_be_cancelled_meanwhile() {
         ]),
     );
     let (s, _dir) = services_server(fake.clone());
-    s.services.lock().await.busy.insert(JOB.into());
+    s.services
+        .lock()
+        .await
+        .busy
+        .lock()
+        .unwrap()
+        .insert(JOB.into());
     let r = s
         .service_cancel(Parameters(CancelParams {
             job: JOB.into(),
@@ -3634,7 +3640,13 @@ async fn the_follow_through_leaves_a_job_another_call_is_working_on() {
         generic_ok("claim1"),
     );
     let (s, _dir) = services_server(fake.clone());
-    s.services.lock().await.busy.insert(JOB.into());
+    s.services
+        .lock()
+        .await
+        .busy
+        .lock()
+        .unwrap()
+        .insert(JOB.into());
     assert!(s.follow_through().await.is_empty());
     nothing_sent(&fake);
 }
@@ -3857,4 +3869,16 @@ fn the_follow_through_interval_is_whole_seconds_within_an_hour() {
     for bad in ["0", "3601", "1.5", "", "-1", "fast"] {
         assert!(parse_follow_through(bad).is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn a_call_dropped_midway_frees_its_job() {
+    let (s, _dir) = services_server(node());
+    // A call that never finishes, dropped the way a cancelled request is.
+    let stuck = s.one_at_a_time(JOB, std::future::pending::<Result<(), String>>());
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(10), stuck).await;
+    assert_eq!(
+        s.one_at_a_time(JOB, async { Ok::<_, String>(1) }).await,
+        Ok(1)
+    );
 }
