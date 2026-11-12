@@ -4495,3 +4495,68 @@ async fn offers_that_fail_to_advertise_are_tried_again() {
     assert!(tries[0][SVC].get("error").is_some(), "{tries:?}");
     assert!(tries[1][SVC].get("error").is_none(), "{tries:?}");
 }
+
+/// A second request, for another job, from the same buyer.
+fn other_request(job: &str) -> String {
+    let mut m = protocol::Message::new(
+        job,
+        Body::Request {
+            service: SVC.into(),
+            input: Payload::Text("another".into()),
+        },
+    );
+    m.id = format!("{:032x}", 9);
+    protocol::encode(&m)
+}
+
+#[tokio::test]
+async fn a_payment_claimed_but_not_made_holds_no_place() {
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+    let fake = node();
+    // Job one says it's paid, but its escrow holds nothing; job two is a request.
+    let q = escrow_quote_text(AGENT_FROM, FAR, FAR + 600_000);
+    let paid = proto(
+        3,
+        Body::Paid {
+            quote: protocol::quote_hash(&q),
+            tx_hash: "open1".into(),
+            escrow_buyer: Some(PROVIDER_ACCOUNT.into()),
+        },
+    );
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (false, &request_text()),
+            (true, &q),
+            (false, &paid),
+            (false, &other_request(OTHER)),
+        ]),
+    );
+    fake.set("lez_core.get_account_public", no_job_record());
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&spec(Some("http://127.0.0.1:9/run"), 1))
+        .await
+        .unwrap();
+    assert_eq!(s.follow_through().await, [format!("service_quote {OTHER}")]);
+}
+
+#[tokio::test]
+async fn a_paid_job_waits_while_the_offers_handlers_are_busy() {
+    let (url, seen) = handler(vec![("200 OK", r#"{"output": {"text": "done"}}"#)]);
+    let (s, fake, _dir) = paid_job_for(&url, FAR + 600_000).await;
+    // Another job of this offer has the one handler it may run.
+    s.services
+        .lock()
+        .await
+        .running
+        .lock()
+        .unwrap()
+        .insert("another-job".into(), SVC.into());
+    s.follow_through().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+}

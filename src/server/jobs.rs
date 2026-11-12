@@ -301,8 +301,8 @@ pub(super) struct Services {
     /// A plain mutex, so a call's guard can free its job when the call is
     /// dropped midway, as a cancelled request is.
     pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
-    /// Jobs whose handler is running, one task per job.
-    running: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Jobs whose handler is running, one task per job: job -> service id.
+    pub(super) running: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -412,6 +412,45 @@ impl Busy {
 impl Drop for Busy {
     fn drop(&mut self) {
         self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job);
+    }
+}
+
+/// A job's handler, marked running until this is dropped. An offer runs at
+/// most its `max_jobs` handlers at once.
+struct Running {
+    map: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    job: String,
+}
+
+impl Running {
+    fn claim(
+        map: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+        job: &str,
+        service: &str,
+        max_jobs: u32,
+    ) -> Option<Self> {
+        let claimed = {
+            let mut running = map.lock().unwrap_or_else(|e| e.into_inner());
+            let busy = running.values().filter(|s| *s == service).count();
+            let free = !running.contains_key(job) && busy < max_jobs as usize;
+            if free {
+                running.insert(job.to_string(), service.to_string());
+            }
+            free
+        };
+        claimed.then(|| Self {
+            map,
+            job: job.to_string(),
+        })
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.job);
@@ -1095,18 +1134,29 @@ impl AgentServer {
                 state.offers.clone(),
             )
         };
-        // What each offer has taken: quotes still open, and paid jobs not yet delivered.
+        // What each offer has taken: quotes still open, and handlers at work.
+        // A payment only claimed in chat takes nothing until a handler runs.
         let now = now_ms();
         let mut taken = BTreeMap::<String, u32>::new();
         for f in &jobs {
-            let open = match f.job.state {
-                State::Quoted => f.job.quote.as_ref().is_some_and(|q| q.expires_at > now),
-                State::Paid => true,
-                _ => false,
-            };
-            if f.job.role == Role::Provider && open {
+            let open = f.job.role == Role::Provider
+                && f.job.state == State::Quoted
+                && !settled.contains(&f.job.job)
+                && f.job.quote.as_ref().is_some_and(|q| q.expires_at > now);
+            if open {
                 *taken.entry(f.job.service.clone()).or_default() += 1;
             }
+        }
+        for service in self
+            .services
+            .lock()
+            .await
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            *taken.entry(service.clone()).or_default() += 1;
         }
         for found in jobs {
             // The user can switch the tools off while a pass runs.
@@ -1193,10 +1243,14 @@ impl AgentServer {
         job: &Job,
         auto: &Auto,
     ) -> Result<Option<(&'static str, Value)>, String> {
-        let set = self.services.lock().await.running.clone();
-        let Some(running) = Busy::claim(set, &job.job) else {
+        let map = self.services.lock().await.running.clone();
+        if map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&job.job)
+        {
             return Ok(None);
-        };
+        }
         let q = job.quote.as_ref().ok_or("the job has no quote")?;
         let deadline = q
             .expires_at
@@ -1221,12 +1275,15 @@ impl AgentServer {
             }
         }
         if too_late_for(deadline) {
-            drop(running);
             let v = self
                 .reject_job(&job.job, "too late to deliver before the deadline")
                 .await?;
             return Ok(Some(("service_reject", v)));
         }
+        // Paid jobs wait while the offer's handlers are all at work.
+        let Some(running) = Running::claim(map, &job.job, &job.service, auto.max_jobs) else {
+            return Ok(None);
+        };
         let kept = self.saved_result(&job.job).await?;
         let server = self.clone();
         let (job, auto) = (job.clone(), auto.clone());
