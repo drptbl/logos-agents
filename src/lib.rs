@@ -6,6 +6,7 @@
 
 pub mod escrow;
 pub mod protocol;
+pub mod provider;
 pub mod server;
 
 /// Check the settings read from the env before serving, so a bad one stops
