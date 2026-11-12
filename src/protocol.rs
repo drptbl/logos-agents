@@ -216,6 +216,14 @@ pub struct Job {
     pub output: Option<Payload>,
     pub reason: Option<String>,
     pub updated_ms: u64,
+    /// The request's text, exactly as it went out, so the buyer can send it again.
+    #[serde(skip)]
+    pub request: String,
+    /// How many times this side sent the request, and when it last did.
+    #[serde(skip)]
+    pub asks: u32,
+    #[serde(skip)]
+    pub asked_ms: u64,
 }
 
 impl Job {
@@ -245,6 +253,16 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
             continue;
         };
         if !seen_ids.insert(m.id.clone()) {
+            // A buyer's request sent again: the same job, asked once more.
+            if seen.from_self
+                && matches!(m.body, Body::Request { .. })
+                && let Some(job) = jobs
+                    .iter_mut()
+                    .find(|j| j.job == m.job && j.role == Role::Buyer)
+            {
+                job.asks += 1;
+                job.asked_ms = seen.timestamp_ms;
+            }
             continue;
         }
         let index = jobs.iter().position(|j| j.job == m.job);
@@ -266,6 +284,9 @@ pub fn replay<'a>(messages: impl IntoIterator<Item = Seen<'a>>) -> Vec<Job> {
                     output: None,
                     reason: None,
                     updated_ms: seen.timestamp_ms,
+                    request: seen.text.to_string(),
+                    asks: u32::from(seen.from_self),
+                    asked_ms: seen.timestamp_ms,
                 });
             }
             continue;

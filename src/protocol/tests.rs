@@ -292,3 +292,17 @@ fn a_malformed_escrow_offer_spoils_the_quote() {
     let bad = escrow_quote(10_000).replace("\"Public/4n2D", "\"4n2D");
     assert_eq!(parse(&bad), None);
 }
+
+#[test]
+fn a_request_sent_again_is_one_job_asked_twice() {
+    let text = request();
+    let mut first = seen(true, &text);
+    first.timestamp_ms = 10;
+    let mut again = seen(true, &text);
+    again.timestamp_ms = 70;
+    let jobs = replay([first, again]);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].state, State::Requested);
+    assert_eq!((jobs[0].asks, jobs[0].asked_ms), (2, 70));
+    assert_eq!(jobs[0].request, request());
+}
