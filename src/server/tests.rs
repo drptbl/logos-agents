@@ -996,6 +996,7 @@ fn services_server_in(fake: Arc<Routed>, dir: &std::path::Path) -> AgentServer {
             })),
             discovery_bootstrap: vec![FLEET_PEER.into()],
             host_owns_messaging: false,
+            delivery_config: None,
         },
     ))
 }
