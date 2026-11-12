@@ -121,6 +121,8 @@ fn text(r: &CallToolResult) -> String {
 struct Routed {
     replies: Mutex<BTreeMap<String, VecDeque<RawOutput>>>,
     calls: Mutex<Vec<Vec<String>>>,
+    /// Keys whose calls never answer, like a node that stops mid-call.
+    hangs: Mutex<std::collections::BTreeSet<String>>,
 }
 
 fn key(argv: &[String]) -> String {
@@ -174,6 +176,9 @@ impl Runner for Routed {
     fn run(&self, args: Vec<String>) -> RunFuture<'_> {
         let k = key(&args);
         self.calls.lock().unwrap().push(args);
+        if self.hangs.lock().unwrap().contains(&k) {
+            return Box::pin(std::future::pending());
+        }
         let mut replies = self.replies.lock().unwrap();
         let next = match replies.get_mut(&k) {
             Some(queue) if queue.len() > 1 => queue.pop_front().unwrap(),
@@ -3880,5 +3885,60 @@ async fn a_call_dropped_midway_frees_its_job() {
     assert_eq!(
         s.one_at_a_time(JOB, async { Ok::<_, String>(1) }).await,
         Ok(1)
+    );
+}
+
+#[tokio::test]
+async fn a_server_stopped_mid_send_does_not_send_again_after_a_restart() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+    );
+    // The claim goes out, and the server stops before it hears back.
+    fake.hangs
+        .lock()
+        .unwrap()
+        .insert("lez_core.send_generic_public_transaction".into());
+    let dir = tempfile::tempdir().unwrap();
+    let s = services_server_in(fake.clone(), dir.path());
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        s.service_claim(job(JOB)),
+    )
+    .await;
+    assert!(stopped.is_err(), "the send should still be waiting");
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+
+    // After a restart over the same wallet, nothing is sent again while the
+    // first call may still land.
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(FAR + 600_000),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("claim2"),
+    );
+    let s = services_server_in(fake.clone(), dir.path());
+    assert!(s.follow_through().await.is_empty());
+    let r = s.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
     );
 }

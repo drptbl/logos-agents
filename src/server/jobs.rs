@@ -667,10 +667,12 @@ impl AgentServer {
 
     /// Remember (`Some`) or forget (`None`) a job's escrow call, dropping
     /// ones too old to wait for.
-    async fn note_in_flight(&self, job: &str, call: Option<InFlight>) {
+    /// Save, or forget, the escrow call in flight for `job`. An error means
+    /// the record didn't reach the file.
+    async fn note_in_flight(&self, job: &str, call: Option<InFlight>) -> Result<(), String> {
         let mut state = self.with_in_flight().await;
-        if state.in_flight_unreadable.is_some() {
-            return;
+        if let Some(e) = &state.in_flight_unreadable {
+            return Err(unreadable_in_flight(e));
         }
         match call {
             Some(f) => state.in_flight.insert(job.to_string(), f),
@@ -680,14 +682,14 @@ impl AgentServer {
         state
             .in_flight
             .retain(|_, f| now.saturating_sub(f.sent_ms) < IN_FLIGHT_MS);
-        let saved = self.base.wallet_side_file(IN_FLIGHT).map(|file| {
-            serde_json::to_vec_pretty(&state.in_flight)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
-        });
-        if let Some(Err(e)) = saved {
-            tracing::warn!("could not save the escrow calls in flight: {e}");
-        }
+        let file = self
+            .base
+            .wallet_side_file(IN_FLIGHT)
+            .ok_or("no wallet configured")?;
+        serde_json::to_vec_pretty(&state.in_flight)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
+            .map_err(|e| format!("could not save the escrow calls in flight: {e}"))
     }
 
     /// Send a job's escrow instruction, read in state `seen`, unless an
@@ -741,7 +743,9 @@ impl AgentServer {
             match self.escrow_record(e).await {
                 Ok(Some(r)) if e.holds(&r) && r.state == seen => {}
                 Ok(_) => {
-                    self.note_in_flight(job, None).await;
+                    if let Err(e) = self.note_in_flight(job, None).await {
+                        tracing::warn!("{e}");
+                    }
                     return Err(format!(
                         "an earlier escrow call for this job, {tx}, has landed: check service_jobs, then call again if it's still needed"
                     ));
@@ -749,21 +753,26 @@ impl AgentServer {
                 Err(err) => return Err(format!("can't read the job's escrow: {err}")),
             }
         }
-        let sent = self.escrow_send(signer, accounts, ix).await;
-        let tx = match &sent {
-            Ok(tx) => Some(tx.clone()),
-            Err(SendError::MaybeSent(_)) => None,
-            Err(SendError::NotSent(_)) => return sent.map_err(SendError::message),
+        // Noted before it goes out, as may have been sent: a server stopped
+        // mid-send then waits for it after a restart rather than sending again.
+        let call = |tx| InFlight {
+            tx,
+            sent_ms: now_ms(),
+            from: Some(seen),
         };
-        self.note_in_flight(
-            job,
-            Some(InFlight {
-                tx,
-                sent_ms: now_ms(),
-                from: Some(seen),
-            }),
-        )
-        .await;
+        self.note_in_flight(job, Some(call(None)))
+            .await
+            .map_err(|e| format!("{e}: not sending the escrow call"))?;
+        let sent = self.escrow_send(signer, accounts, ix).await;
+        let after = match &sent {
+            Ok(tx) => Some(call(Some(tx.clone()))),
+            // Nothing went out, so nothing is in flight.
+            Err(SendError::NotSent(_)) => None,
+            Err(SendError::MaybeSent(_)) => Some(call(None)),
+        };
+        if let Err(e) = self.note_in_flight(job, after).await {
+            tracing::warn!("{e}");
+        }
         sent.map_err(SendError::message)
     }
 
