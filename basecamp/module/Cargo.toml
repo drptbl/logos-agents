@@ -1,6 +1,6 @@
 [package]
 name = "logos_agents_module"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 
 # Standalone crate: built by logos-module-builder, not part of the repo's workspace.
