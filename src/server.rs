@@ -45,7 +45,9 @@ pub fn follow_through_every() -> Result<std::time::Duration, String> {
     let secs = match std::env::var(FOLLOW_THROUGH_ENV) {
         Err(std::env::VarError::NotPresent) => return Ok(FOLLOW_THROUGH_EVERY),
         Ok(secs) => secs,
-        Err(std::env::VarError::NotUnicode(_)) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{FOLLOW_THROUGH_ENV} is not UTF-8"));
+        }
     };
     parse_follow_through(&secs)
 }
@@ -120,7 +122,7 @@ impl AgentServer {
     }
 
     /// Take the steps that only wait on the chain, for every job, every
-    /// minute from now on: see [`jobs`]. Runs once however often it is
+    /// [`follow_through_every`] from now on: see [`jobs`]. Runs once however often it is
     /// called, until the tokio runtime it was called in stops.
     pub fn start_follow_through(&self) {
         if self.following.set(()).is_err() {
