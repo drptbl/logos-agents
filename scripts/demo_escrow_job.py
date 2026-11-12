@@ -100,9 +100,9 @@ def fleet_peers():
         return ",".join(line for line in lines if line and not line.startswith("#"))
 
 
-def run(cmd):
+def run(cmd, env=None):
     """A command's stdout. On failure it exits with the command's stderr."""
-    done = subprocess.run(cmd, capture_output=True, text=True)
+    done = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if done.returncode != 0:
         sys.exit(f"{os.path.basename(cmd[0])} {' '.join(cmd[1:3])} failed: {done.stderr.strip()}")
     return done.stdout
@@ -134,6 +134,10 @@ def on_devnet(args):
     for side in ("provider", "buyer"):
         session = devnet("session", "env", f"agents-{side}")
         setattr(args, f"{side}_session", session["LOGOSCTL_CONFIG_DIR"])
+        # libp2p_module 1.1.0 lets a node be found only for the first service it
+        # advertises: start each run with it fresh.
+        run(["logosctl", "module", "reload", "libp2p_module"],
+            env=dict(os.environ, LOGOSCTL_CONFIG_DIR=session["LOGOSCTL_CONFIG_DIR"]))
         # wallet_config.json and storage.json, side by side.
         setattr(args, f"{side}_wallet", os.path.dirname(session["LOGOS_DEVNET_WALLET_CONFIG"]))
         if side == "buyer":
