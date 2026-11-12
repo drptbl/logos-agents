@@ -32,6 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import demo_escrow_job as demo  # noqa: E402
 
 DECLINE = "please decline this one"
+# How long the buyer waits for a quote before asking again.
+ASK_AGAIN = 90
 # What the quote handler charges per word of input.
 PER_WORD = 50_000
 
@@ -103,10 +105,11 @@ def main():
     provider_files = tempfile.mkdtemp(prefix="logos-agents-provider-files-")
     buyer_files = tempfile.mkdtemp(prefix="logos-agents-buyer-files-")
     offers = os.path.join(logs, "offers.toml")
+    # Room for a request asked again whose first try was quoted after all.
     with open(offers, "w") as f:
         f.write(f'[[offer]]\nservice_id = "{args.service}"\ntag = "summarize"\n'
                 f'price_lepta = "{args.price}"\ndeliver_within_s = 3600\nhandler = "{url}"\n'
-                f'quote_handler = "{base}/quote"\nmax_jobs = 2\n')
+                f'quote_handler = "{base}/quote"\nmax_jobs = 4\n')
 
     wallet = sides.provider_wallet
     provider_env = dict(
@@ -134,9 +137,20 @@ def main():
 
         def job(text="", **input_):
             input_ = input_ or {"input_text": text}
-            job = demo.call(buyer, "buyer", "service_request", chat_address=found["chat_address"],
-                            service_id=args.service, **input_)["job"]
-            demo.wait_for(lambda: demo.state(buyer, job) == "quoted", "the provider's quote", args.timeout)
+            # Chat has no delivery receipt, and the first message in a new
+            # conversation can be lost: ask again, as service_request says to.
+            deadline = time.time() + args.timeout
+            while True:
+                job = demo.call(buyer, "buyer", "service_request", chat_address=found["chat_address"],
+                                service_id=args.service, **input_)["job"]
+                sent_at = time.time()
+                while time.time() - sent_at < ASK_AGAIN and demo.state(buyer, job) != "quoted":
+                    time.sleep(demo.POLL)
+                if demo.state(buyer, job) == "quoted":
+                    break
+                if time.time() > deadline:
+                    sys.exit("timed out waiting for the provider's quote")
+                demo.log("[buyer] no quote yet, asking again")
             price = demo.job_in(buyer, job)["quote"]["price_lepta"]
             # The quote handler gets a CID without its content, so no words.
             if price != price_of(text):
