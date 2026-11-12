@@ -24,8 +24,9 @@ server only uses a wallet it opened itself, so if another logos-mcp server
 used a session since lez_core loaded, reload lez_core there too.
 
 With --devnet, it runs on the local devnet that `logos-devnet up` starts from
-logos-devnet.toml instead: the sessions, a funded wallet per side and the escrow
-id come from it, and only logos-devnet and logosctl need to be on PATH.
+logos-devnet.toml instead: each side uses its session and the session's funded
+wallet, the escrow id comes from the devnet, and only logos-devnet and logosctl
+need to be on PATH.
 
 Exits non-zero if a job does not complete.
 """
@@ -100,8 +101,7 @@ def fleet_peers():
 
 
 def run(cmd):
-    """A command's stdout. On failure it exits with the command's stderr, which never holds
-    a secret: devnet_wallets.sh keeps the recovery phrase out of it."""
+    """A command's stdout. On failure it exits with the command's stderr."""
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode != 0:
         sys.exit(f"{os.path.basename(cmd[0])} {' '.join(cmd[1:3])} failed: {done.stderr.strip()}")
@@ -115,21 +115,21 @@ def devnet(*args):
 
 def on_devnet(args):
     """Fills in sessions, wallets and the escrow id from the devnet that `logos-devnet up`
-    started from logos-devnet.toml: both servers take its env, and each side gets a new
-    wallet, funded from its faucet."""
+    started from logos-devnet.toml: both servers take its env, and each side uses its
+    session's wallet, which the faucet funds."""
     env = devnet("env")
     # An id left in the shell, such as the testnet's, must not stand in for the devnet's.
     if not env.get("LOGOS_PROGRAM_ESCROW"):
-        sys.exit("the devnet has no escrow deployed: run scripts/fetch_escrow.sh, then logos-devnet up")
+        sys.exit("the devnet has no escrow deployed: run logos-devnet up in this repo")
     os.environ.update(env)
     for side in ("provider", "buyer"):
-        setattr(args, f"{side}_session", devnet("session", "env", f"agents-{side}")["LOGOSCTL_CONFIG_DIR"])
-    wallets = tempfile.mkdtemp(prefix="logos-agents-devnet-wallets-")
-    made = run([os.path.join(SCRIPTS, "devnet_wallets.sh"), wallets])
-    args.provider_wallet = os.path.join(wallets, "provider")
-    args.buyer_wallet = os.path.join(wallets, "buyer")
-    args.buyer_from = made.strip()
-    log(f"devnet wallets in {wallets}, buyer {args.buyer_from}")
+        session = devnet("session", "env", f"agents-{side}")
+        setattr(args, f"{side}_session", session["LOGOSCTL_CONFIG_DIR"])
+        # wallet_config.json and storage.json, side by side.
+        setattr(args, f"{side}_wallet", os.path.dirname(session["LOGOS_DEVNET_WALLET_CONFIG"]))
+        if side == "buyer":
+            args.buyer_from = session["LOGOS_DEVNET_ACCOUNT"]
+    log(f"devnet sessions agents-provider and agents-buyer, buyer {args.buyer_from}")
 
 
 def call(c, who, tool, **args):

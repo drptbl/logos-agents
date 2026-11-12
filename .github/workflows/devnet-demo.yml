@@ -12,8 +12,6 @@ on:
       - logos-devnet.toml
       - scripts/demo_escrow_job.py
       - scripts/e2e.py
-      - scripts/devnet_wallets.sh
-      - scripts/fetch_escrow.sh
       - scripts/logos-dev-peers.txt
 
 permissions:
@@ -37,10 +35,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked
-      - run: scripts/fetch_escrow.sh
       # Installs logosctl for the sessions, then starts the devnet from logos-devnet.toml:
       # the escrow and a logosctl session per side.
-      - uses: drptbl/logos-devnet@v0.3.6
+      - uses: drptbl/logos-devnet@v0.3.8
       - run: python3 scripts/demo_escrow_job.py --devnet --decline --poll 3 --timeout 600
       # Each server's log, which the demo keeps in a logos-mcp-demo-* folder.
       - if: always()

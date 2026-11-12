@@ -110,12 +110,11 @@ A run with `--decline` took about 11 minutes on `logos.dev`.
 On a local chain it took under a minute and needs no faucet. [logos-devnet](https://github.com/drptbl/logos-devnet) runs one, and `logos-devnet.toml` sets it up for this repo: the escrow program, from a [logos-escrow](https://github.com/drptbl/logos-escrow) release, and a `logosctl` session for each side:
 
 ```bash
-scripts/fetch_escrow.sh
 logos-devnet up
 python3 scripts/demo_escrow_job.py --devnet --decline --poll 3
 ```
 
-With `--devnet`, the demo gives each side a new wallet funded from the devnet's faucet, and runs both servers with the devnet's `LOGOS_PROGRAM_ESCROW`, the local escrow's id. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. `--poll 3` checks every 3 seconds instead of every minute, in the demo and both servers. Chat and discovery still go over the `logos.dev` fleet.
+With `--devnet`, each side uses its session's wallet, which the devnet's faucet funds, and the demo runs both servers with the devnet's `LOGOS_PROGRAM_ESCROW`, the local escrow's id. Without it, a server uses the testnet's escrow. Keep it the same while a job runs: a server on another id can't refund or claim that job. `--poll 3` checks every 3 seconds instead of every minute, in the demo and both servers. Chat and discovery still go over the `logos.dev` fleet.
 
 ## History
 
