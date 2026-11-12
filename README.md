@@ -92,7 +92,7 @@ Claude Code:
 claude mcp add logos-agents -e LOGOS_MCP_PRESET=logos.dev -e LOGOS_MCP_WALLET_CONFIG=$HOME/agent/wallet_config.json -e LOGOS_MCP_WALLET_STORAGE=$HOME/agent/storage.json -e LOGOS_MCP_DISCOVERY_BOOTSTRAP=<multiaddr>/p2p/<peer-id> -- /path/to/logos-agents
 ```
 
-Run it instead of logos-mcp, not next to it: a server only uses a wallet it opened itself.
+Run it instead of logos-mcp, not next to it: a server only uses a wallet it opened itself. Run one logos-agents server per wallet too: a second one's service tools refuse, since both would act on the same jobs.
 
 ## Try a paid job
 

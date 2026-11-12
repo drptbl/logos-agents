@@ -34,6 +34,8 @@ const RESULTS: &str = "service-results.json";
 const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
+/// Held by the one server running this wallet's services.
+const SERVICE_LOCK: &str = "service.lock";
 /// How long an escrow call is waited for before it counts as dropped:
 /// calls landed in 2 to 7 minutes live.
 const IN_FLIGHT_MS: u64 = 15 * 60 * 1000;
@@ -271,7 +273,9 @@ pub(super) struct Services {
     pub(super) pending: BTreeMap<String, String>,
     /// Jobs a call is paying, cancelling, delivering, claiming or refunding
     /// right now: one at a time per job.
-    pub(super) busy: BTreeSet<String>,
+    /// A plain mutex, so a call's guard can free its job when the call is
+    /// dropped midway, as a cancelled request is.
+    pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -287,11 +291,104 @@ pub(super) struct Services {
     in_flight_loaded: bool,
     /// Why `IN_FLIGHT` couldn't be read, as for `payments_unreadable`.
     in_flight_unreadable: Option<String>,
+    /// This wallet's service lock, held for as long as this server runs: two
+    /// servers on one wallet would each pay, claim and refund the same jobs,
+    /// and write over each other's records.
+    wallet_lock: Option<std::fs::File>,
     /// Jobs the follow-through found over on chain, claimed, refunded or
     /// returned: it stops reading them.
     pub(super) settled: BTreeSet<String>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
+}
+
+impl AgentServer {
+    /// Take this wallet's service lock, once per server: another server
+    /// holding it runs this wallet's jobs. The OS releases it when the
+    /// server stops, however it stops.
+    async fn hold_wallet(&self) -> Result<(), WalletLock> {
+        let mut state = self.services.lock().await;
+        if state.wallet_lock.is_some() {
+            return Ok(());
+        }
+        // No wallet, no records to guard.
+        let Some(path) = self.base.wallet_side_file(SERVICE_LOCK) else {
+            return Ok(());
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                WalletLock::Failed(format!("can't open {SERVICE_LOCK} next to the wallet: {e}"))
+            })?;
+        match file.try_lock() {
+            Ok(()) => {
+                state.wallet_lock = Some(file);
+                // What was read before belongs to the server that held the
+                // wallet then: read it again, so it isn't written back stale.
+                state.submitted.clear();
+                state.payments_loaded = false;
+                state.payments_unreadable = None;
+                state.in_flight.clear();
+                state.in_flight_loaded = false;
+                state.in_flight_unreadable = None;
+                Ok(())
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(WalletLock::HeldElsewhere),
+            Err(std::fs::TryLockError::Error(e)) => Err(WalletLock::Failed(format!(
+                "can't lock {SERVICE_LOCK} next to the wallet: {e}"
+            ))),
+        }
+    }
+}
+
+/// Why this server can't run its wallet's services.
+#[derive(Debug)]
+enum WalletLock {
+    HeldElsewhere,
+    Failed(String),
+}
+
+impl std::fmt::Display for WalletLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeldElsewhere => f.write_str(
+                "another logos-agents server is running this wallet's services: run one per wallet, or give each its own wallet",
+            ),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// A job marked busy until this is dropped: when the call finishes, fails or
+/// is dropped midway.
+struct Busy {
+    set: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    job: String,
+}
+
+impl Busy {
+    fn claim(set: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>, job: &str) -> Option<Self> {
+        let claimed = set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job.to_string());
+        claimed.then(|| Self {
+            set,
+            job: job.to_string(),
+        })
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job);
+    }
 }
 
 /// A job and the conversation that carries it.
@@ -634,13 +731,15 @@ impl AgentServer {
         state
     }
 
-    /// Remember (`Some`) or forget (`None`) a job's escrow call, dropping
-    /// ones too old to wait for.
-    async fn note_in_flight(&self, job: &str, call: Option<InFlight>) {
+    /// Save (`Some`) or forget (`None`) the escrow call in flight for `job`,
+    /// dropping ones too old to wait for. An error means the record didn't
+    /// reach the file, and memory keeps what the file holds.
+    async fn note_in_flight(&self, job: &str, call: Option<InFlight>) -> Result<(), String> {
         let mut state = self.with_in_flight().await;
-        if state.in_flight_unreadable.is_some() {
-            return;
+        if let Some(e) = &state.in_flight_unreadable {
+            return Err(unreadable_in_flight(e));
         }
+        let before = state.in_flight.clone();
         match call {
             Some(f) => state.in_flight.insert(job.to_string(), f),
             None => state.in_flight.remove(job),
@@ -649,14 +748,28 @@ impl AgentServer {
         state
             .in_flight
             .retain(|_, f| now.saturating_sub(f.sent_ms) < IN_FLIGHT_MS);
-        let saved = self.base.wallet_side_file(IN_FLIGHT).map(|file| {
-            serde_json::to_vec_pretty(&state.in_flight)
+        let saved = match self.base.wallet_side_file(IN_FLIGHT) {
+            Some(file) => serde_json::to_vec_pretty(&state.in_flight)
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string()))
-        });
-        if let Some(Err(e)) = saved {
-            tracing::warn!("could not save the escrow calls in flight: {e}");
+                .and_then(|bytes| guard::write_private(&file, &bytes).map_err(|e| e.to_string())),
+            None => Err("no wallet configured".into()),
+        };
+        if let Err(e) = saved {
+            state.in_flight = before;
+            return Err(format!("could not save the escrow calls in flight: {e}"));
         }
+        Ok(())
+    }
+
+    /// Whether an escrow call for `job` was sent recently enough that it may
+    /// still land. An unreadable record counts as one.
+    async fn in_flight_recent(&self, job: &str) -> bool {
+        let state = self.with_in_flight().await;
+        state.in_flight_unreadable.is_some()
+            || state
+                .in_flight
+                .get(job)
+                .is_some_and(|f| now_ms().saturating_sub(f.sent_ms) < IN_FLIGHT_MS)
     }
 
     /// Send a job's escrow instruction, read in state `seen`, unless an
@@ -710,7 +823,9 @@ impl AgentServer {
             match self.escrow_record(e).await {
                 Ok(Some(r)) if e.holds(&r) && r.state == seen => {}
                 Ok(_) => {
-                    self.note_in_flight(job, None).await;
+                    if let Err(e) = self.note_in_flight(job, None).await {
+                        tracing::warn!("{e}");
+                    }
                     return Err(format!(
                         "an earlier escrow call for this job, {tx}, has landed: check service_jobs, then call again if it's still needed"
                     ));
@@ -718,21 +833,26 @@ impl AgentServer {
                 Err(err) => return Err(format!("can't read the job's escrow: {err}")),
             }
         }
-        let sent = self.escrow_send(signer, accounts, ix).await;
-        let tx = match &sent {
-            Ok(tx) => Some(tx.clone()),
-            Err(SendError::MaybeSent(_)) => None,
-            Err(SendError::NotSent(_)) => return sent.map_err(SendError::message),
+        // Noted before it goes out, as may have been sent: a server stopped
+        // mid-send then waits for it after a restart rather than sending again.
+        let call = |tx| InFlight {
+            tx,
+            sent_ms: now_ms(),
+            from: Some(seen),
         };
-        self.note_in_flight(
-            job,
-            Some(InFlight {
-                tx,
-                sent_ms: now_ms(),
-                from: Some(seen),
-            }),
-        )
-        .await;
+        self.note_in_flight(job, Some(call(None)))
+            .await
+            .map_err(|e| format!("{e}: not sending the escrow call"))?;
+        let sent = self.escrow_send(signer, accounts, ix).await;
+        let after = match &sent {
+            Ok(tx) => Some(call(Some(tx.clone()))),
+            // Nothing went out, so nothing is in flight.
+            Err(SendError::NotSent(_)) => None,
+            Err(SendError::MaybeSent(_)) => Some(call(None)),
+        };
+        if let Err(e) = self.note_in_flight(job, after).await {
+            tracing::warn!("{e}");
+        }
         sent.map_err(SendError::message)
     }
 
@@ -921,6 +1041,15 @@ impl AgentServer {
         let mut done = Vec::new();
         if !self.follows_through() {
             return done;
+        }
+        match self.hold_wallet().await {
+            Ok(()) => {}
+            // Another server running this wallet's services follows its jobs through.
+            Err(WalletLock::HeldElsewhere) => return done,
+            Err(e) => {
+                tracing::warn!("follow-through off: {e}");
+                return done;
+            }
         }
         let Ok(jobs) = self.all_jobs().await else {
             return done;
@@ -1121,6 +1250,10 @@ impl AgentServer {
     ) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.needs(&["chat", "discovery", "wallet"]) {
             return fail(e);
+        }
+        // Another server running this wallet's services would get the requests.
+        if let Err(e) = self.hold_wallet().await {
+            return fail(e.to_string());
         }
         if let Err(e) = guard::validate_service_id(&p.service_id) {
             return fail(e);
@@ -1389,6 +1522,9 @@ impl AgentServer {
         if let Err(e) = self.needs(&["chat", "wallet"]) {
             return fail(e);
         }
+        if let Err(e) = self.hold_wallet().await {
+            return fail(e.to_string());
+        }
         // One quote at a time, so a job never gets two accounts.
         let _quoting = self.quoting.lock().await;
         let (convo, job) = match self.find_job(&p.job, Role::Provider).await {
@@ -1598,6 +1734,18 @@ impl AgentServer {
                         result: hash,
                         deadline: e.deadline,
                     };
+                    // An earlier delivery may still land, and then its own output
+                    // must go out: don't keep another in its place.
+                    if self.in_flight_recent(&job.job).await
+                        && self
+                            .saved_result(&job.job)
+                            .await?
+                            .is_some_and(|o| o != kept)
+                    {
+                        return Err(
+                            "an earlier delivery with another output may still land: send the same output, or check service_jobs in a few minutes".into(),
+                        );
+                    }
                     // Kept before it is recorded: a delivery with no clear
                     // answer may still land, and then this output goes out.
                     self.save_result(&job.job, Some(&kept))
@@ -2106,23 +2254,21 @@ impl AgentServer {
             }
             None => (q.pay_to.clone(), None),
         };
-        // An escrow payment is noted before it is asked for, so a restart
-        // can't lose which account it goes from: without that, no open. An
-        // earlier note, from an open with no clear outcome, outlives this try.
+        // Noted before it is asked for, as may have gone out: a call stopped
+        // mid-send can't then pay again, and an escrow payment keeps the
+        // account it goes from, without which no refund. An earlier note,
+        // from an open with no clear outcome, outlives this try.
         let earlier = self.with_payments().await.submitted.get(&p.job).cloned();
-        if escrow.is_some()
-            && let Err(e) = self
-                .save_payment(
-                    &p.job,
-                    Some(Payment::Escrow {
-                        tx_hash: None,
-                        escrow_buyer: p.from.clone(),
-                    }),
-                )
-                .await
-        {
+        let noted = match &escrow {
+            Some(_) => Payment::Escrow {
+                tx_hash: None,
+                escrow_buyer: p.from.clone(),
+            },
+            None => Payment::Transfer(None),
+        };
+        if let Err(e) = self.save_payment(&p.job, Some(noted)).await {
             return Err(format!(
-                "can't save which account pays, so a restart could lose the refund: not opening the escrow ({e})"
+                "can't save the payment before sending it, so a restart could pay twice or lose the refund: not paying ({e})"
             ));
         }
         let sent = tool_json(
@@ -2142,14 +2288,9 @@ impl AgentServer {
             Ok(sent) => sent,
             Err(e) => {
                 let maybe = e.contains("may have been sent") || e.contains("may be sent");
-                match (&escrow, maybe) {
-                    (None, true) => {
-                        self.note_payment(&p.job, Some(Payment::Transfer(None)))
-                            .await;
-                    }
-                    // Nothing went out this time.
-                    (Some(_), false) => self.note_payment(&p.job, earlier).await,
-                    _ => {}
+                // Nothing went out this time: back to the earlier note, if any.
+                if !maybe {
+                    self.note_payment(&p.job, earlier).await;
                 }
                 return Err(e);
             }
@@ -2175,6 +2316,11 @@ impl AgentServer {
                 .await;
             return self.tell_paid(&convo, &job.job, tell(tx, None)).await;
         }
+        // Waiting for the user: nothing went out yet. An escrow payment keeps
+        // its note; a transfer is followed through its request instead.
+        if escrow.is_none() {
+            self.note_payment(&p.job, earlier).await;
+        }
         let request_id = sent["request_id"].as_str().unwrap_or_default().to_string();
         self.services
             .lock()
@@ -2189,19 +2335,19 @@ impl AgentServer {
     }
 
     /// Run `work` on `job` unless another call is working on that job.
-    async fn one_at_a_time<T>(
+    pub(super) async fn one_at_a_time<T>(
         &self,
         job: &str,
         work: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
-        if !self.services.lock().await.busy.insert(job.to_string()) {
+        self.hold_wallet().await.map_err(|e| e.to_string())?;
+        let set = self.services.lock().await.busy.clone();
+        let Some(_held) = Busy::claim(set, job) else {
             return Err(format!(
                 "another call is working on job {job}: try again shortly"
             ));
-        }
-        let result = work.await;
-        self.services.lock().await.busy.remove(job);
-        result
+        };
+        work.await
     }
 
     async fn cancel(&self, p: CancelParams) -> Result<Value, String> {
