@@ -13,6 +13,7 @@ on:
       - .github/workflows/devnet-demo.yml
       - logos-devnet.toml
       - scripts/demo_escrow_job.py
+      - scripts/e2e.py
       - scripts/devnet_wallets.sh
       - scripts/fetch_escrow.sh
       - scripts/logos-dev-peers.txt
