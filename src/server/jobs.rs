@@ -1532,22 +1532,18 @@ impl AgentServer {
     }
 
     async fn offer(&self, p: OfferParams, auto: Option<Auto>) -> Result<Value, String> {
-        if let Err(e) = self.needs(&["chat", "discovery", "wallet"]) {
-            return Err(String::from(e));
-        }
+        self.needs(&["chat", "discovery", "wallet"])?;
         // Another server running this wallet's services would get the requests.
         if let Err(e) = self.hold_wallet().await {
-            return Err(String::from(e.to_string()));
+            return Err(e.to_string());
         }
-        if let Err(e) = guard::validate_service_id(&p.service_id) {
-            return Err(String::from(e));
-        }
+        guard::validate_service_id(&p.service_id)?;
         if p.tag.len() > guard::MAX_AD_TAG_BYTES {
-            return Err(String::from(format!(
+            return Err(format!(
                 "tag is {} bytes; discovery allows at most {}",
                 p.tag.len(),
                 guard::MAX_AD_TAG_BYTES
-            )));
+            ));
         }
         if guard::amount_le16_hex(&p.price_lepta).is_err()
             || p.price_lepta.trim_start_matches('0').is_empty()
@@ -1558,26 +1554,24 @@ impl AgentServer {
         }
         let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
         if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
-            return Err(String::from(format!(
+            return Err(format!(
                 "deliver_within_s must be between 1 and {MAX_DELIVER_S} seconds"
-            )));
+            ));
         }
         if let Err(e) = self.base.wallet() {
-            return Err(String::from(format!(
-                "services are paid into the agent wallet: {e}"
-            )));
+            return Err(format!("services are paid into the agent wallet: {e}"));
         }
         let escrow_account = if p.escrow == Some(false) {
             None
         } else {
             match self.escrow_account(p.escrow_account.as_deref()).await {
                 Ok(account) => Some(account),
-                Err(e) => return Err(String::from(e)),
+                Err(e) => return Err(e),
             }
         };
         let address = match self.base.ensure_chat().await {
             Ok((address, _)) => address,
-            Err(e) => return Err(String::from(e)),
+            Err(e) => return Err(e),
         };
         let _advertising = self.advertising.lock().await;
         let (replacing, others) = {
@@ -1590,7 +1584,7 @@ impl AgentServer {
             .await
         {
             Ok(id) => id,
-            Err(e) => return Err(String::from(e)),
+            Err(e) => return Err(e),
         };
         {
             let mut state = self.services.lock().await;
