@@ -4,17 +4,21 @@
 `logos-agents provide` serves one offer whose handler is a small HTTP server
 started here, with no agent on the provider's side. The same server prices
 each request by its word count, as the offer's quote handler. A buyer agent
-finds it, asks for two jobs and pays for each into escrow:
+finds it, asks for three jobs and pays for each into escrow:
 
 1. the handler answers the first, and the buyer gets that output, then the
    provider's server claims the price
 2. the handler declines the second, and the buyer's server takes the money back
+3. the third's input is a file the buyer put in Logos Storage. The provider's
+   server fetches it for the handler, uploads the handler's file in return, and
+   the buyer downloads that by its CID
 
 Run `logos-devnet up` in this repo first. logos-devnet and logosctl must be on
 PATH, and target/debug/logos-agents built. Exits non-zero if a job does not
 complete.
 """
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -37,8 +41,9 @@ def price_of(text):
 
 
 def serve_handler():
-    """A handler on this machine: it summarises a text, declines DECLINE, and on
-    /quote prices a request by its word count."""
+    """A handler on this machine: it summarises a text, declines DECLINE, turns
+    a file's content to upper case, and on /quote prices a request by its word
+    count."""
     asked = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -53,7 +58,11 @@ def serve_handler():
                 self.wfile.write(body)
                 return
             asked.append(job)
-            if text == DECLINE:
+            if "content_b64" in job["input"]:
+                status = 200
+                content = base64.b64decode(job["input"]["content_b64"]).upper()
+                body = json.dumps({"output": {"content_b64": base64.b64encode(content).decode()}}).encode()
+            elif text == DECLINE:
                 status, body = 422, b"this handler won't do that one"
             else:
                 status = 200
@@ -90,6 +99,9 @@ def main():
     base, asked = serve_handler()
     url = f"{base}/run"
     logs = tempfile.mkdtemp(prefix="logos-mcp-demo-")
+    # Each side's files root, for what goes through storage.
+    provider_files = tempfile.mkdtemp(prefix="logos-agents-provider-files-")
+    buyer_files = tempfile.mkdtemp(prefix="logos-agents-buyer-files-")
     offers = os.path.join(logs, "offers.toml")
     with open(offers, "w") as f:
         f.write(f'[[offer]]\nservice_id = "{args.service}"\ntag = "summarize"\n'
@@ -105,13 +117,14 @@ def main():
         LOGOS_MCP_WALLET_STORAGE=os.path.join(wallet, "storage.json"),
         LOGOS_MCP_DISCOVERY_BOOTSTRAP=sides.bootstrap,
         LOGOS_AGENTS_FOLLOW_THROUGH_SECS=str(args.poll),
+        LOGOS_MCP_FILES_ROOT=provider_files,
     )
     provider = subprocess.Popen([args.bin, "provide", offers], env=provider_env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=open(os.path.join(logs, "provider.log"), "w"))
     demo.log(f"[provider] logos-agents provide, handler {url}")
     buyer = demo.start("buyer", args.bin, sides.buyer_session, sides.buyer_wallet, sides.bootstrap,
-                       "logos.dev", logs)
+                       "logos.dev", logs, files_root=buyer_files)
     try:
         def find():
             _, body = buyer.tool("service_find", service_id=args.service)
@@ -119,11 +132,13 @@ def main():
         found = demo.wait_for(find, "the provider's offer", 300, 5)
         demo.log(f"[buyer] found provider {found['peer_id']}")
 
-        def job(text):
+        def job(text="", **input_):
+            input_ = input_ or {"input_text": text}
             job = demo.call(buyer, "buyer", "service_request", chat_address=found["chat_address"],
-                            service_id=args.service, input_text=text)["job"]
+                            service_id=args.service, **input_)["job"]
             demo.wait_for(lambda: demo.state(buyer, job) == "quoted", "the provider's quote", args.timeout)
             price = demo.job_in(buyer, job)["quote"]["price_lepta"]
+            # The quote handler gets a CID without its content, so no words.
             if price != price_of(text):
                 sys.exit(f"quoted {price} lepta, not the quote handler's {price_of(text)}")
             demo.log(f"[provider] quoted {price} lepta on its own, by the word")
@@ -141,8 +156,37 @@ def main():
         declined = job(DECLINE)
         demo.wait_for(lambda: demo.escrow(buyer, declined) == "refunded", "the refund", args.timeout)
         demo.log("[buyer] the declined job's price is back")
-        if len(asked) != 2:
-            sys.exit(f"the handler was asked {len(asked)} times, not twice")
+        def transfer(session):
+            _, t = buyer.tool("storage_transfer_status", session_id=session)
+            if isinstance(t, dict) and t.get("done"):
+                if not t.get("success"):
+                    sys.exit(f"storage transfer {session} failed: {t}")
+                return t
+            return None
+
+        with open(os.path.join(buyer_files, "input.txt"), "w") as f:
+            f.write(demo.DOCUMENT)
+        upload = demo.call(buyer, "buyer", "storage_upload", path="input.txt")["session_id"]
+        cid = demo.wait_for(lambda: transfer(upload), "the input's upload", args.timeout)["cid"]
+        demo.log(f"[buyer] put the input in storage as {cid}")
+        stored = job(input_cid=cid)
+        output = demo.wait_for(
+            lambda: (demo.job_in(buyer, stored) or {}).get("output") if demo.state(buyer, stored) == "delivered" else None,
+            "the handler's file", args.timeout)
+        if "cid" not in output:
+            sys.exit(f"the output came back as {output}, not a CID")
+        demo.log(f"[buyer] the output is in storage as {output['cid']}")
+        download = demo.call(buyer, "buyer", "storage_download", cid=output["cid"], path="output.txt")["session_id"]
+        demo.wait_for(lambda: transfer(download), "the output's download", args.timeout)
+        with open(os.path.join(buyer_files, "output.txt")) as f:
+            if f.read() != demo.DOCUMENT.upper():
+                sys.exit("the downloaded output isn't the handler's")
+        demo.log("[buyer] downloaded the handler's file")
+        demo.wait_for(lambda: demo.escrow(buyer, stored) == "claimed", "the provider's claim", args.timeout)
+        if len(asked) != 3:
+            sys.exit(f"the handler was asked {len(asked)} times, not three")
+        if left := os.listdir(os.path.join(provider_files, "logos-agents-jobs")):
+            sys.exit(f"the provider left {left} in its files root")
     finally:
         provider.terminate()
         provider.wait(timeout=60)
