@@ -34,6 +34,8 @@ const RESULTS: &str = "service-results.json";
 const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
+/// Held by the one server running this wallet's services.
+const SERVICE_LOCK: &str = "service.lock";
 /// How long an escrow call is waited for before it counts as dropped:
 /// calls landed in 2 to 7 minutes live.
 const IN_FLIGHT_MS: u64 = 15 * 60 * 1000;
@@ -289,11 +291,49 @@ pub(super) struct Services {
     in_flight_loaded: bool,
     /// Why `IN_FLIGHT` couldn't be read, as for `payments_unreadable`.
     in_flight_unreadable: Option<String>,
+    /// This wallet's service lock, held for as long as this server runs: two
+    /// servers on one wallet would each pay, claim and refund the same jobs,
+    /// and write over each other's records.
+    wallet_lock: Option<std::fs::File>,
     /// Jobs the follow-through found over on chain, claimed, refunded or
     /// returned: it stops reading them.
     pub(super) settled: BTreeSet<String>,
     /// Service ids this server advertised.
     advertised: BTreeSet<String>,
+}
+
+impl AgentServer {
+    /// Take this wallet's service lock, once per server: another server
+    /// holding it runs this wallet's jobs. The OS releases it when the
+    /// server stops, however it stops.
+    async fn hold_wallet(&self) -> Result<(), String> {
+        let mut state = self.services.lock().await;
+        if state.wallet_lock.is_some() {
+            return Ok(());
+        }
+        let path = self
+            .base
+            .wallet_side_file(SERVICE_LOCK)
+            .ok_or("no wallet configured")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("can't open {SERVICE_LOCK} next to the wallet: {e}"))?;
+        match file.try_lock() {
+            Ok(()) => {
+                state.wallet_lock = Some(file);
+                Ok(())
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(
+                "another logos-agents server is running this wallet's services: run one per wallet, or give each its own wallet".into(),
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("can't lock {SERVICE_LOCK} next to the wallet: {e}"))
+            }
+        }
+    }
 }
 
 /// A job marked busy until this is dropped: when the call finishes, fails or
@@ -959,7 +999,8 @@ impl AgentServer {
     /// work or declines. Returns what it did, as `tool job` lines.
     pub(super) async fn follow_through(&self) -> Vec<String> {
         let mut done = Vec::new();
-        if !self.follows_through() {
+        // Another server running this wallet's services follows its jobs through.
+        if !self.follows_through() || self.hold_wallet().await.is_err() {
             return done;
         }
         let Ok(jobs) = self.all_jobs().await else {
@@ -1427,6 +1468,9 @@ impl AgentServer {
         Parameters(p): Parameters<JobParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.needs(&["chat", "wallet"]) {
+            return fail(e);
+        }
+        if let Err(e) = self.hold_wallet().await {
             return fail(e);
         }
         // One quote at a time, so a job never gets two accounts.
@@ -2234,6 +2278,7 @@ impl AgentServer {
         job: &str,
         work: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
+        self.hold_wallet().await?;
         let set = self.services.lock().await.busy.clone();
         let Some(_held) = Busy::claim(set, job) else {
             return Err(format!(

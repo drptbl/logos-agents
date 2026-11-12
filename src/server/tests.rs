@@ -1512,6 +1512,8 @@ async fn paying_an_escrow_quote_opens_it_and_tells_once_it_landed() {
         "lez_core.get_account_public",
         job_record(AGENT_FROM, PROVIDER_ACCOUNT, 1_000_000, FAR + 600_000, 0),
     );
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake.clone(), dir.path());
     let r = s
         .service_pay(CancellationToken::new(), pay())
@@ -2596,6 +2598,8 @@ async fn a_refund_keeps_the_paying_account_until_it_lands() {
         "lez_core.poll_transaction_status",
         lez("poll_transaction_status", "false"),
     );
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake.clone(), dir.path());
     let r = s.service_refund(job(JOB)).await.unwrap();
     assert!(is_error(&r), "{}", text(&r));
@@ -2606,9 +2610,13 @@ async fn a_refund_keeps_the_paying_account_until_it_lands() {
     );
 
     // Once it landed, the note goes.
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake_with(4), dir.path());
     let r = s.service_refund(job(JOB)).await.unwrap();
     assert!(!is_error(&r), "{}", text(&r));
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake_with(4), dir.path());
     let r = s.service_refund(job(JOB)).await.unwrap();
     assert!(is_error(&r), "{}", text(&r));
@@ -3803,6 +3811,8 @@ async fn an_open_landing_while_it_is_checked_is_not_taken_as_refused() {
         "lez_core.poll_transaction_status",
         lez("poll_transaction_status", "true"),
     );
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake.clone(), dir.path());
     assert!(s.follow_through().await.is_empty());
     assert_eq!(s.follow_through().await, [format!("service_pay {JOB}")]);
@@ -3933,6 +3943,8 @@ async fn a_server_stopped_mid_send_does_not_send_again_after_a_restart() {
         "lez_core.send_generic_public_transaction",
         generic_ok("claim2"),
     );
+    // Stopped, as a restart stops it: its wallet lock goes with it.
+    drop(s);
     let s = services_server_in(fake.clone(), dir.path());
     assert!(s.follow_through().await.is_empty());
     let r = s.service_claim(job(JOB)).await.unwrap();
@@ -3940,5 +3952,56 @@ async fn a_server_stopped_mid_send_does_not_send_again_after_a_restart() {
     assert!(
         fake.calls_to("lez_core.send_generic_public_transaction")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn one_server_at_a_time_runs_a_wallets_services() {
+    let released = || {
+        let fake = node();
+        fake.set(
+            "chat_module.get_messages",
+            provider_escrow_history(FAR + 600_000),
+        );
+        fake.set(
+            "lez_core.get_account_public",
+            job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, FAR + 600_000, 3),
+        );
+        fake.set(
+            "lez_core.send_generic_public_transaction",
+            generic_ok("claim1"),
+        );
+        fake
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let first = services_server_in(released(), dir.path());
+    let r = first.service_jobs().await.unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    first
+        .one_at_a_time("other-job", async { Ok::<_, String>(()) })
+        .await
+        .unwrap();
+
+    // A second server over the same wallet leaves its jobs alone.
+    let fake = released();
+    let second = services_server_in(fake.clone(), dir.path());
+    let r = second.service_claim(job(JOB)).await.unwrap();
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(
+        text(&r).contains("another logos-agents server"),
+        "{}",
+        text(&r)
+    );
+    assert!(second.follow_through().await.is_empty());
+    assert!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .is_empty()
+    );
+
+    // Once the first has stopped, the second takes over.
+    drop(first);
+    assert_eq!(
+        second.follow_through().await,
+        [format!("service_claim {JOB}")]
     );
 }
