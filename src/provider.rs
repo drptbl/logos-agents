@@ -6,10 +6,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use logos_mcp::guard;
+
 use crate::protocol::Payload;
 
 /// The delivery window an offer promises when it names none, as `service_offer`'s default.
 const DEFAULT_DELIVER_S: u64 = 600;
+/// The longest delivery window an offer may promise, and an escrow quote may
+/// lock a buyer's money for beyond its own life.
+pub const MAX_DELIVER_S: u64 = 24 * 60 * 60;
 /// The most of a handler's answer read: an output must fit a chat message anyway.
 const MAX_ANSWER_BYTES: u64 = 1024 * 1024;
 /// The most of a declining handler's reason passed on to the buyer.
@@ -106,6 +111,34 @@ fn checked(raw: Vec<RawOffer>) -> Result<Vec<OfferSpec>, String> {
         .map(|raw| {
             if !seen.insert(raw.service_id.clone()) {
                 return Err(format!("{} is offered twice", raw.service_id));
+            }
+            // The checks service_offer makes, here so a bad offer is refused at
+            // once rather than retried.
+            guard::validate_service_id(&raw.service_id)?;
+            if raw.tag.len() > guard::MAX_AD_TAG_BYTES {
+                return Err(format!(
+                    "{}: tag is {} bytes, more than discovery's {}",
+                    raw.service_id,
+                    raw.tag.len(),
+                    guard::MAX_AD_TAG_BYTES
+                ));
+            }
+            if guard::amount_le16_hex(&raw.price_lepta).is_err()
+                || raw.price_lepta.trim_start_matches('0').is_empty()
+            {
+                return Err(format!(
+                    "{}: price_lepta must be a whole number of lepta above zero",
+                    raw.service_id
+                ));
+            }
+            if raw
+                .deliver_within_s
+                .is_some_and(|s| s == 0 || s > MAX_DELIVER_S)
+            {
+                return Err(format!(
+                    "{}: deliver_within_s must be between 1 and {MAX_DELIVER_S}",
+                    raw.service_id
+                ));
             }
             if raw.max_jobs == Some(0) {
                 return Err(format!("{}: max_jobs must be at least 1", raw.service_id));

@@ -40,9 +40,7 @@ const ENVELOPE_BYTES: usize = 1024;
 /// checks block timestamps, seen 138 s behind, and a refused call costs its
 /// whole fee.
 const DEADLINE_MARGIN_MS: u64 = 5 * 60 * 1000;
-/// The longest delivery window an offer may promise, and an escrow quote may
-/// lock a buyer's money for beyond its own life.
-const MAX_DELIVER_S: u64 = 24 * 60 * 60;
+use crate::provider::MAX_DELIVER_S;
 /// Next to the wallet: payments sent, or maybe sent, before the provider was told.
 const PAYMENTS: &str = "service-payments.json";
 /// Next to the wallet: the output of each recorded delivery, kept until the
@@ -50,7 +48,7 @@ const PAYMENTS: &str = "service-payments.json";
 const RESULTS: &str = "service-results.json";
 
 /// What the follow-through does, for the agent.
-const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, quotes, delivers new work or declines. Calling the step a job's next names does it sooner.";
+const FOLLOW_THROUGH: &str = "while it runs, this server takes the steps that only wait on the chain, by default once a minute: it tells the provider once a payment lands, sends a recorded result once its delivery lands, then claims, and refunds a declined or overdue job. It never pays, and only quotes, works or declines jobs for an offer with a handler, which runs on its own. Calling the step a job's next names does it sooner.";
 /// Escrow calls that may still land, kept across restarts.
 const IN_FLIGHT: &str = "service-in-flight.json";
 /// Held by the one server running this wallet's services.
@@ -1118,8 +1116,9 @@ impl AgentServer {
 
     /// One pass over every job, taking the steps that only waited on the
     /// chain: telling the provider once a payment lands, sending a recorded
-    /// result, claiming and refunding. It never pays, quotes, delivers new
-    /// work or declines. Returns what it did, as `tool job` lines.
+    /// result, claiming and refunding. It never pays, and only quotes, works
+    /// or declines jobs for an offer with a handler. Returns what it did, as
+    /// `tool job` lines.
     pub(super) async fn follow_through(&self) -> Vec<String> {
         let mut done = Vec::new();
         if !self.follows_through() {

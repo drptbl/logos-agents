@@ -74,6 +74,12 @@ fn a_broken_offers_file_is_refused_whole() {
         one("hander = \"http://127.0.0.1/x\""),
         format!("{}\n{}", one(""), one("")),
         "offer = 3".to_string(),
+        one("deliver_within_s = 0"),
+        one("deliver_within_s = 86401"),
+        one("").replace("price_lepta = \"1\"", "price_lepta = \"0\""),
+        one("").replace("price_lepta = \"1\"", "price_lepta = \"1.5\""),
+        one("").replace("tag = \"t\"", &format!("tag = \"{}\"", "t".repeat(34))),
+        one("").replace("a/b/v1", "not a service id"),
     ] {
         assert!(parse_offers(&bad).is_err(), "{bad}");
     }
