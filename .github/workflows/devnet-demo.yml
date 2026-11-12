@@ -1,12 +1,10 @@
 # A paid job between two agents on a local LEZ devnet: scripts/demo_escrow_job.py with
 # --decline, each tool called once and the follow-through doing the rest. Chat and
-# discovery go over the public logos.dev fleet, so this runs nightly and on demand, and
-# on PRs that change the demo itself, rather than gating every PR on that network.
+# discovery go over the public logos.dev fleet, so this runs on demand and on PRs that
+# change the demo itself, rather than gating every PR on that network.
 name: devnet demo
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch: {}
   pull_request:
     paths:
