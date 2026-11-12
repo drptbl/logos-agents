@@ -128,8 +128,8 @@ fn stub(status: &'static str, body: &'static str) -> (String, std::thread::JoinH
 }
 
 fn request() -> HandlerRequest<'static> {
-    static INPUT: std::sync::LazyLock<Payload> =
-        std::sync::LazyLock::new(|| Payload::Text("summarise this".into()));
+    static INPUT: std::sync::LazyLock<HandlerInput> =
+        std::sync::LazyLock::new(|| HandlerInput::from(&Payload::Text("summarise this".into())));
     HandlerRequest {
         job: "j1",
         service_id: "acme/summarize/v1",
@@ -143,7 +143,7 @@ fn request() -> HandlerRequest<'static> {
 fn a_handler_gets_the_job_and_returns_its_output() {
     let (url, served) = stub("200 OK", r#"{"output": {"text": "a summary"}}"#);
     let answer = call_handler(&url, &request(), Duration::from_secs(5));
-    assert_eq!(answer, Answer::Output(Payload::Text("a summary".into())));
+    assert_eq!(answer, Answer::Output(Output::Text("a summary".into())));
     let seen = served.join().unwrap();
     assert!(seen.starts_with("POST /run "), "{seen}");
     let body: serde_json::Value =
@@ -179,6 +179,76 @@ fn a_client_error_declines_and_a_server_error_retries() {
     assert!(matches!(
         call_handler(&url, &request(), Duration::from_secs(5)),
         Answer::Retry(_)
+    ));
+}
+
+#[test]
+fn a_cid_input_goes_to_the_handler_with_its_content() {
+    let (url, served) = stub("200 OK", r#"{"output": {"text": "a summary"}}"#);
+    let input = HandlerInput::from(&Payload::Cid("zDvCid".into())).with_content(b"hello");
+    let asked = HandlerRequest {
+        input: &input,
+        ..request()
+    };
+    call_handler(&url, &asked, Duration::from_secs(5));
+    let seen = served.join().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&seen[seen.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(
+        body["input"],
+        serde_json::json!({"cid": "zDvCid", "content_b64": "aGVsbG8="})
+    );
+}
+
+#[test]
+fn a_content_output_comes_back_as_its_bytes() {
+    let (url, _served) = stub("200 OK", r#"{"output": {"content_b64": "aGVsbG8="}}"#);
+    assert_eq!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Output(Output::Content(b"hello".to_vec()))
+    );
+}
+
+#[test]
+fn an_output_that_isnt_exactly_one_thing_declines() {
+    for body in [
+        r#"{"output": {"content_b64": "not base64!"}}"#,
+        r#"{"output": {"text": "a", "cid": "b"}}"#,
+        r#"{"output": {}}"#,
+        r#"{"output": {"content_b64": ""}}"#,
+    ] {
+        let (url, _served) = stub("200 OK", body);
+        assert!(
+            matches!(
+                call_handler(&url, &request(), Duration::from_secs(5)),
+                Answer::Declined(_)
+            ),
+            "{body}"
+        );
+    }
+    static OVER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use base64::Engine as _;
+        let content = vec![0u8; MAX_CONTENT_BYTES + 1];
+        format!(
+            r#"{{"output": {{"content_b64": "{}"}}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(content)
+        )
+    });
+    let (url, _served) = stub("200 OK", &OVER);
+    assert!(matches!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Declined(e) if e.contains("MiB")
+    ));
+    static LONG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            r#"{{"output": {{"text": "{}"}}}}"#,
+            "x".repeat(MAX_CONTENT_BYTES + 1)
+        )
+    });
+    let (url, _served) = stub("200 OK", &LONG);
+    assert!(matches!(
+        call_handler(&url, &request(), Duration::from_secs(5)),
+        Answer::Declined(e) if e.contains("MiB")
     ));
 }
 
@@ -225,7 +295,7 @@ fn a_redirect_or_an_answer_too_big_declines() {
     static BIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         format!(
             r#"{{"output": {{"text": "{}"}}}}"#,
-            "x".repeat(2 * 1024 * 1024)
+            "x".repeat(13 * 1024 * 1024)
         )
     });
     let (url, _served) = stub("200 OK", &BIG);
@@ -244,7 +314,7 @@ fn a_handler_on_this_machine_is_reached_without_a_proxy() {
     assert_eq!(agent.config().max_redirects(), 0);
     assert_eq!(
         call_handler(&url, &request(), Duration::from_secs(5)),
-        Answer::Output(Payload::Text("a summary".into()))
+        Answer::Output(Output::Text("a summary".into()))
     );
 }
 

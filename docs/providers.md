@@ -51,7 +51,13 @@ Content-Type: application/json
 {"job": "<id>", "service_id": "acme/summarize/v1", "input": {"text": "..."}, "price_lepta": "1000000", "deadline_ms": 1794400000000}
 ```
 
-`input` is `{"text": ...}` or `{"cid": ...}`, as the buyer sent it. It's untrusted. The request goes to the handler's URL itself: no proxy, and no redirects. The answer is the output in the same shape:
+`input` is `{"text": ...}` or `{"cid": ...}`, as the buyer sent it. It's untrusted. For a CID, a server with storage on (see [Storage](#storage)) fetches the content from Logos Storage first and adds it as `content_b64`, standard base64, so the handler never touches storage:
+
+```json
+{"cid": "zDv...", "content_b64": "aGVsbG8="}
+```
+
+With storage off the handler gets the CID alone, to fetch itself. The request goes to the handler's URL itself: no proxy, and no redirects. The answer is the output:
 
 ```http
 200 OK
@@ -60,12 +66,30 @@ Content-Type: application/json
 {"output": {"text": "..."}}
 ```
 
+| Output | What the server delivers |
+| --- | --- |
+| `{"text": ...}` | the text. Text too big for a chat message is uploaded to Logos Storage and delivered as its CID |
+| `{"cid": ...}` | the CID, as the handler gives it |
+| `{"content_b64": ...}` | the content, standard base64 with padding, uploaded to Logos Storage and delivered as its CID |
+
 | Answer | What the server does |
 | --- | --- |
 | `200` with an output | records the delivery |
 | `4xx` | declines the job with the response body as the reason. A buyer who paid into escrow gets a refund at once |
 | `5xx`, a timeout or no connection | tries again with backoff while there's time to deliver, then declines |
-| an output too big for a chat message, an answer that can't be read, or a redirect | declines |
+| an answer that can't be read, or a redirect | declines |
+
+## Storage
+
+Storage is on when the server has a files root and the user allows Storage. The files root is `--files-root` or `LOGOS_MCP_FILES_ROOT` for `provide`, and `files_root` in the Basecamp module's config. The server keeps each job's files in `logos-agents-jobs/` there, and removes them once the content is sent on. Files a server stopped part way left behind are removed once they're two days old.
+
+- Inputs and outputs are at most 8 MiB each, text included. An empty content output is declined.
+- An input over that, or a CID Logos Storage doesn't take, is declined before the handler is asked. An input storage can't fetch for now is tried again while there's time, then declined.
+- An output that fails to upload is uploaded again while there's time, without asking the handler again, then declined.
+- With storage off, a content output, or text too big for a chat message, is declined.
+- Once services are switched off, nothing more is uploaded. The handler is asked again when they're back on.
+
+Fetching and uploading come out of the same time the handler has, at most 10 minutes a try.
 
 The same job can reach the handler twice, after a retry or a restart. `job` stays the same, so the handler can return its earlier output.
 
@@ -80,7 +104,7 @@ Content-Type: application/json
 {"job": "<id>", "service_id": "acme/summarize/v1", "input": {"text": "..."}, "price_lepta": "1000000"}
 ```
 
-`price_lepta` is the offer's own price, for a handler that adjusts it. The answer is the price, and a delivery window in seconds if it isn't the offer's:
+`input` is as the buyer sent it: a CID input comes without its content, since quoting has 15 seconds. `price_lepta` is the offer's own price, for a handler that adjusts it. The answer is the price, and a delivery window in seconds if it isn't the offer's:
 
 ```http
 200 OK

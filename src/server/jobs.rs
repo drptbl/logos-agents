@@ -36,6 +36,10 @@ const DELIVER_SLACK_MS: u64 = 60 * 1000;
 const QUOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The reason a full offer gives the buyer.
 const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
+/// Where a server keeps its handlers' storage files, under the files root.
+const JOBS_DIR: &str = "logos-agents-jobs";
+/// The longest one fetch or upload is given before it's tried again.
+const STORAGE_TRY_MS: u64 = 10 * 60 * 1000;
 /// Room kept in a chat message for the protocol fields around a text input or output.
 const ENVELOPE_BYTES: usize = 1024;
 /// Kept between an escrow deadline and the calls that race it: the chain
@@ -554,6 +558,104 @@ fn handler_time_left(deadline: u64) -> u64 {
         .saturating_sub(now_ms())
 }
 
+/// One try at something that may work later.
+enum Step<T> {
+    Done(T),
+    /// It won't work: decline, giving this reason.
+    Fail(String),
+    /// It may work later.
+    Retry(String),
+}
+
+/// Try `attempt` until it's done or fails for good, waiting longer after each
+/// failure for now, while a handler for a job due at `deadline` has time. Each
+/// try is given the ms left.
+async fn retrying<T, F>(
+    deadline: u64,
+    what: &str,
+    mut attempt: impl FnMut(u64) -> F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Step<T>>,
+{
+    let late = || format!("{what} didn't finish in time");
+    let mut wait = RETRY_FIRST;
+    loop {
+        let left = handler_time_left(deadline);
+        if left < 1000 {
+            return Err(late());
+        }
+        let step = tokio::time::timeout(std::time::Duration::from_millis(left), attempt(left))
+            .await
+            .unwrap_or_else(|_| Step::Retry("it ran out of time".into()));
+        match step {
+            Step::Done(t) => return Ok(t),
+            Step::Fail(reason) => return Err(reason),
+            Step::Retry(e) => {
+                tracing::warn!("{what} failed for now: {e}");
+                if u128::from(handler_time_left(deadline)) < wait.as_millis() + 1000 {
+                    return Err(late());
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(RETRY_MAX);
+            }
+        }
+    }
+}
+
+/// A new file for a job's storage content: its path relative to the files
+/// root, and in full. Files a run that stopped part way left behind are removed
+/// once they're older than any job lasts.
+pub(super) fn job_file(
+    root: &guard::FilesRoot,
+    job: &str,
+    ext: &str,
+) -> Result<(String, std::path::PathBuf), String> {
+    if job.is_empty() || !job.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("job id {job:?} can't name a file"));
+    }
+    let dir = root.path().join(JOBS_DIR);
+    let dir = std::fs::create_dir_all(&dir)
+        .and_then(|()| dir.canonicalize())
+        .map_err(|e| format!("can't use {JOBS_DIR} in the files root: {e}"))?;
+    if !dir.starts_with(root.path()) {
+        return Err(format!("{JOBS_DIR} leads out of the files root"));
+    }
+    remove_stale(&dir);
+    // Named afresh each time, so servers sharing the root never meet.
+    let mut tag = [0u8; 8];
+    let _ = getrandom::fill(&mut tag);
+    let name = format!("{job}-{:016x}.{ext}", u64::from_le_bytes(tag));
+    Ok((format!("{JOBS_DIR}/{name}"), dir.join(name)))
+}
+
+/// Remove the files in `dir` older than any job lasts.
+fn remove_stale(dir: &std::path::Path) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
+        2 * crate::provider::MAX_DELIVER_S,
+    )) else {
+        return;
+    };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        // The entry itself, never what a link points to.
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+            && meta.modified().is_ok_and(|m| m < cutoff)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A job's file, removed however its step ends.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -561,20 +663,20 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Whether `text` fits a chat message, measured as it travels: escaped inside
+/// the JSON message.
+fn fits_chat(text: &str) -> bool {
+    serde_json::to_string(text).map_or(usize::MAX, |e| e.len()) <= MAX_CHAT_BYTES - ENVELOPE_BYTES
+}
+
 /// Exactly one of text or a CID, small enough to travel in a chat message.
 fn payload(text: Option<String>, cid: Option<String>, what: &str) -> Result<Payload, String> {
     match (text, cid) {
         (Some(t), None) if t.is_empty() => Err(format!("{what}_text is empty")),
-        // Measured as it travels: escaped inside the JSON message.
-        (Some(t), None)
-            if serde_json::to_string(&t).map_or(usize::MAX, |e| e.len())
-                > MAX_CHAT_BYTES - ENVELOPE_BYTES =>
-        {
-            Err(format!(
-                "{what}_text is too big for a chat message once encoded; put it in Logos Storage and send its CID instead (limit about {} bytes)",
-                MAX_CHAT_BYTES - ENVELOPE_BYTES
-            ))
-        }
+        (Some(t), None) if !fits_chat(&t) => Err(format!(
+            "{what}_text is too big for a chat message once encoded; put it in Logos Storage and send its CID instead (limit about {} bytes)",
+            MAX_CHAT_BYTES - ENVELOPE_BYTES
+        )),
         (Some(t), None) => Ok(Payload::Text(t)),
         (None, Some(c))
             if c.is_empty() || c.len() > 200 || !c.chars().all(|ch| ch.is_ascii_alphanumeric()) =>
@@ -1380,55 +1482,22 @@ impl AgentServer {
     /// there's time, then deliver it or decline the job. An output kept from
     /// before is delivered without asking again.
     async fn run_handler(&self, job: Job, auto: Auto, deadline: u64, kept: Option<Payload>) {
-        use crate::provider::{Answer, HandlerRequest, call_handler};
-        let mut wait = RETRY_FIRST;
-        let answer = loop {
-            if let Some(output) = &kept {
-                break Answer::Output(output.clone());
+        let outcome = match kept {
+            Some(output) => Ok(Some(output)),
+            None => self.handler_output(&job, &auto, deadline).await,
+        };
+        let outcome = match outcome {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => {
+                tracing::info!(job = %job.job, "provider: services are off, the job waits");
+                return;
             }
-            let left = handler_time_left(deadline);
-            if left < 1000 {
-                break Answer::Declined("the handler didn't finish in time".into());
-            }
-            let (url, id, service, input, price) = (
-                auto.handler.clone(),
-                job.job.clone(),
-                job.service.clone(),
-                job.input.clone(),
-                job.quote
-                    .as_ref()
-                    .map(|q| q.price_lepta.clone())
-                    .unwrap_or_default(),
-            );
-            let answer = tokio::task::spawn_blocking(move || {
-                let asked = HandlerRequest {
-                    job: &id,
-                    service_id: &service,
-                    input: &input,
-                    price_lepta: &price,
-                    deadline_ms: deadline,
-                };
-                call_handler(&url, &asked, std::time::Duration::from_millis(left))
-            })
-            .await
-            .unwrap_or_else(|e| Answer::Retry(e.to_string()));
-            match answer {
-                Answer::Retry(e) => {
-                    tracing::warn!(job = %job.job, "handler failed for now: {e}");
-                    let left = handler_time_left(deadline);
-                    if u128::from(left) < wait.as_millis() + 1000 {
-                        break Answer::Declined("the handler didn't finish in time".into());
-                    }
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(RETRY_MAX);
-                }
-                other => break other,
-            }
+            Err(reason) => Err(reason),
         };
         // The user may have switched the tools off while the handler worked:
         // act on nothing now, and keep an output for when they're back on.
         if !self.follows_through() {
-            if let Answer::Output(output) = &answer
+            if let Ok(output) = &outcome
                 && let Err(e) = self.save_result(&job.job, Some(output)).await
             {
                 tracing::warn!(job = %job.job, "can't keep the handler's output: {e}");
@@ -1436,8 +1505,8 @@ impl AgentServer {
             tracing::info!(job = %job.job, "provider: services are off, the job waits");
             return;
         }
-        let (tool, result) = match answer {
-            Answer::Output(output) => {
+        let (tool, result) = match outcome {
+            Ok(output) => {
                 let (output_text, output_cid) = match output {
                     Payload::Text(t) => (Some(t), None),
                     Payload::Cid(c) => (None, Some(c)),
@@ -1466,10 +1535,7 @@ impl AgentServer {
                     ),
                 }
             }
-            Answer::Declined(reason) => {
-                ("service_reject", self.reject_job(&job.job, &reason).await)
-            }
-            Answer::Retry(_) => unreachable!("retries loop until an answer or a decline"),
+            Err(reason) => ("service_reject", self.reject_job(&job.job, &reason).await),
         };
         match &result {
             Ok(v) => {
@@ -1491,6 +1557,173 @@ impl AgentServer {
                 );
             }
         }
+    }
+
+    /// A job's output from its handler, as it can be delivered, or why the job
+    /// is declined. With storage on, a CID input's content is fetched for the
+    /// handler, and content it returns, or text too big for a chat message, is
+    /// uploaded. Each step tries again while it fails for now and there's time.
+    /// `None` when services went off before anything was uploaded.
+    async fn handler_output(
+        &self,
+        job: &Job,
+        auto: &Auto,
+        deadline: u64,
+    ) -> Result<Option<Payload>, String> {
+        use crate::provider::{Answer, HandlerInput, HandlerRequest, Output, call_handler};
+        let mut input = HandlerInput::from(&job.input);
+        if let Payload::Cid(cid) = &job.input
+            && self.storage_on()
+        {
+            // Never fetched, so never worth trying again.
+            guard::validate_cid(cid)
+                .map_err(|_| "the input's CID isn't one Logos Storage takes".to_string())?;
+            let content = retrying(deadline, "fetching the input", |left| {
+                self.fetch_input(&job.job, cid, left)
+            })
+            .await?;
+            input = input.with_content(&content);
+        }
+        let price = job
+            .quote
+            .as_ref()
+            .map(|q| q.price_lepta.clone())
+            .unwrap_or_default();
+        let output = retrying(deadline, "the handler", |left| {
+            let (url, id, service, input, price) = (
+                auto.handler.clone(),
+                job.job.clone(),
+                job.service.clone(),
+                input.clone(),
+                price.clone(),
+            );
+            async move {
+                let answer = tokio::task::spawn_blocking(move || {
+                    let asked = HandlerRequest {
+                        job: &id,
+                        service_id: &service,
+                        input: &input,
+                        price_lepta: &price,
+                        deadline_ms: deadline,
+                    };
+                    call_handler(&url, &asked, std::time::Duration::from_millis(left))
+                })
+                .await
+                .unwrap_or_else(|e| Answer::Retry(e.to_string()));
+                match answer {
+                    Answer::Output(o) => Step::Done(o),
+                    Answer::Declined(reason) => Step::Fail(reason),
+                    Answer::Retry(e) => Step::Retry(e),
+                }
+            }
+        })
+        .await?;
+        let content = match output {
+            Output::Cid(c) => return Ok(Some(Payload::Cid(c))),
+            Output::Text(t) if fits_chat(&t) => return Ok(Some(Payload::Text(t))),
+            Output::Text(t) => t.into_bytes(),
+            Output::Content(c) => c,
+        };
+        if !self.storage_on() {
+            return Err(
+                "the handler's output needs Logos Storage, and this server has no files root or the user turned Storage off"
+                    .into(),
+            );
+        }
+        // Switched off while the handler worked: put nothing in storage.
+        if !self.follows_through() {
+            return Ok(None);
+        }
+        self.store_output(&job.job, content, deadline)
+            .await
+            .map(Some)
+    }
+
+    /// Whether handlers' content may go through storage: the server has a
+    /// files root, and the user allows Storage.
+    fn storage_on(&self) -> bool {
+        self.base.files_root().is_ok() && self.base.allows("storage_upload")
+    }
+
+    /// Fetch a job's CID input from storage, given `left` ms, into the files root
+    /// and back out of it.
+    async fn fetch_input(&self, job: &str, cid: &str, left: u64) -> Step<Vec<u8>> {
+        use tokio::io::AsyncReadExt as _;
+        const MAX: usize = crate::provider::MAX_CONTENT_BYTES;
+        let over = || Step::Fail(format!("the input is over {} MiB", MAX / (1024 * 1024)));
+        let (rel, full) = match self
+            .base
+            .files_root()
+            .and_then(|root| job_file(root, job, "in"))
+        {
+            Ok(file) => file,
+            Err(e) => return Step::Fail(format!("the input can't be fetched: {e}")),
+        };
+        let wait = std::time::Duration::from_millis(left.min(STORAGE_TRY_MS));
+        match self
+            .base
+            .download_to(cid, &rel, Some(MAX as u64), wait)
+            .await
+        {
+            Ok(_) => {
+                let file = Scratch(full);
+                // Read no more than the cap, whatever is in the file by now.
+                let mut content = Vec::new();
+                let read = match tokio::fs::File::open(&file.0).await {
+                    Ok(f) => f.take(MAX as u64 + 1).read_to_end(&mut content).await,
+                    Err(e) => Err(e),
+                };
+                match read {
+                    Ok(_) if content.len() > MAX => over(),
+                    Ok(_) => Step::Done(content),
+                    Err(e) => Step::Retry(format!("the fetched input can't be read: {e}")),
+                }
+            }
+            // The same content would be over the cap next time too.
+            Err(e) if e.contains(&format!("over the {MAX} byte cap")) => over(),
+            Err(e) => Step::Retry(e),
+        }
+    }
+
+    /// Upload a handler's output to storage, again while it fails for now and
+    /// there's time, and return its CID.
+    async fn store_output(
+        &self,
+        job: &str,
+        content: Vec<u8>,
+        deadline: u64,
+    ) -> Result<Payload, String> {
+        let root = self.base.files_root()?.clone();
+        let content = Arc::new(content);
+        retrying(deadline, "uploading the output", |left| {
+            let (root, content) = (root.clone(), content.clone());
+            async move {
+                let (rel, full) = match job_file(&root, job, "out") {
+                    Ok(file) => file,
+                    Err(e) => return Step::Retry(e),
+                };
+                let file = Scratch(full);
+                let written = {
+                    let rel = rel.clone();
+                    tokio::task::spawn_blocking(move || root.write_new(&rel, &content))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|w| w)
+                };
+                if let Err(e) = written {
+                    return Step::Retry(format!("the output can't be kept for upload: {e}"));
+                }
+                let wait = std::time::Duration::from_millis(left.min(STORAGE_TRY_MS));
+                let uploaded = self.base.upload_file(&rel, wait).await;
+                drop(file);
+                match uploaded {
+                    Ok(cid) => Step::Done(cid),
+                    Err(e) => Step::Retry(e),
+                }
+            }
+        })
+        .await
+        .map(Payload::Cid)
     }
 
     /// Decline a job, giving `reason`: before payment the buyer is told, and

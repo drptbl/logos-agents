@@ -983,14 +983,24 @@ async fn an_input_too_big_once_encoded_is_refused() {
 const GAS_LIMIT: u128 = 200_000;
 
 fn services_server_in(fake: Arc<Routed>, dir: &std::path::Path) -> AgentServer {
+    server_with(fake, dir, None, Arc::new(EventStore::default()))
+}
+
+/// `services_server_in`, with a files root for storage and the events it watches.
+fn server_with(
+    fake: Arc<Routed>,
+    dir: &std::path::Path,
+    files: Option<logos_mcp::guard::FilesRoot>,
+    events: Arc<EventStore>,
+) -> AgentServer {
     let config = dir.join("wallet_config.json");
     if !config.exists() {
         std::fs::write(&config, format!(r#"{{"gas_limit": {GAS_LIMIT}}}"#)).unwrap();
     }
     AgentServer::new(LogosServer::new(
         Arc::new(Logosctl::new(fake)),
-        Arc::new(EventStore::default()),
-        None,
+        events,
+        files,
         NodeSettings {
             preset: "logos.dev".into(),
             mode: "Edge".into(),
@@ -1814,6 +1824,11 @@ async fn an_escrow_job_already_opened_is_not_opened_again() {
 
 /// The provider's view of an escrow job the buyer says it opened.
 fn provider_escrow_history(deadline: u64) -> RawOutput {
+    provider_escrow_history_for(&request_text(), deadline)
+}
+
+/// `provider_escrow_history`, for the request `request`.
+fn provider_escrow_history_for(request: &str, deadline: u64) -> RawOutput {
     let q = escrow_quote_text(AGENT_FROM, deadline - 600_000, deadline);
     let paid = proto(
         3,
@@ -1823,7 +1838,7 @@ fn provider_escrow_history(deadline: u64) -> RawOutput {
             escrow_buyer: Some(PROVIDER_ACCOUNT.into()),
         },
     );
-    history(&[(false, &request_text()), (true, &q), (false, &paid)])
+    history(&[(false, request), (true, &q), (false, &paid)])
 }
 
 #[tokio::test]
@@ -4792,3 +4807,5 @@ async fn the_agents_own_quote_asks_the_quote_handler_too() {
         "{quoted:?}"
     );
 }
+
+mod handler_storage;

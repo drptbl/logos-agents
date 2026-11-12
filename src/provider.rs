@@ -4,6 +4,8 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use logos_mcp::guard;
@@ -15,8 +17,13 @@ const DEFAULT_DELIVER_S: u64 = 600;
 /// The longest delivery window an offer may promise, and an escrow quote may
 /// lock a buyer's money for beyond its own life.
 pub const MAX_DELIVER_S: u64 = 24 * 60 * 60;
-/// The most of a handler's answer read: an output must fit a chat message anyway.
-const MAX_ANSWER_BYTES: u64 = 1024 * 1024;
+/// The most content a job's input or output carries through storage.
+pub const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+/// The most of a handler's answer read: content, base64 encoded, with room for
+/// JSON that escapes its slashes.
+const MAX_ANSWER_BYTES: u64 = (MAX_CONTENT_BYTES as u64).div_ceil(3) * 4 + 1024 * 1024;
+/// The most of a quote handler's answer read: a price is small.
+const MAX_QUOTE_BYTES: u64 = 1024 * 1024;
 /// The most of a declining handler's reason passed on to the buyer.
 const MAX_REASON_CHARS: usize = 200;
 
@@ -211,16 +218,61 @@ pub struct HandlerRequest<'a> {
     pub job: &'a str,
     pub service_id: &'a str,
     /// As the buyer sent it, so untrusted.
-    pub input: &'a Payload,
+    pub input: &'a HandlerInput,
     pub price_lepta: &'a str,
     pub deadline_ms: u64,
+}
+
+/// A job's input as a handler gets it: the buyer's text, or their CID with
+/// its content when the server fetched it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct HandlerInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_b64: Option<String>,
+}
+
+impl From<&Payload> for HandlerInput {
+    fn from(input: &Payload) -> Self {
+        match input {
+            Payload::Text(t) => Self {
+                text: Some(t.clone()),
+                ..Self::default()
+            },
+            Payload::Cid(c) => Self {
+                cid: Some(c.clone()),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+impl HandlerInput {
+    /// The same input, carrying `content` fetched for its CID.
+    pub fn with_content(self, content: &[u8]) -> Self {
+        Self {
+            content_b64: Some(STANDARD.encode(content)),
+            ..self
+        }
+    }
+}
+
+/// A handler's output: text, a CID, or content for the server to upload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Output {
+    Text(String),
+    Cid(String),
+    Content(Vec<u8>),
 }
 
 /// A handler's answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Answer {
     /// The job's output, to deliver.
-    Output(Payload),
+    Output(Output),
     /// The handler can't do this job: decline it, giving this reason.
     Declined(String),
     /// It may work later: a server error, a timeout or no connection.
@@ -229,7 +281,47 @@ pub enum Answer {
 
 #[derive(Deserialize)]
 struct Done {
-    output: Payload,
+    output: RawOutput,
+}
+
+#[derive(Deserialize)]
+struct RawOutput {
+    text: Option<String>,
+    cid: Option<String>,
+    content_b64: Option<String>,
+}
+
+impl RawOutput {
+    /// Exactly one of its fields, with content decoded, and text or content
+    /// within the cap.
+    fn output(self) -> Result<Output, String> {
+        let over = || {
+            Err(format!(
+                "the handler's output is over {} MiB",
+                MAX_CONTENT_BYTES / (1024 * 1024)
+            ))
+        };
+        match (self.text, self.cid, self.content_b64) {
+            (Some(t), None, None) if t.len() > MAX_CONTENT_BYTES => over(),
+            (Some(t), None, None) => Ok(Output::Text(t)),
+            (None, Some(c), None) => Ok(Output::Cid(c)),
+            (None, None, Some(b)) => {
+                let content = STANDARD
+                    .decode(b)
+                    .map_err(|e| format!("the handler's content_b64 isn't base64: {e}"))?;
+                if content.is_empty() {
+                    return Err("the handler's output is empty".into());
+                }
+                if content.len() > MAX_CONTENT_BYTES {
+                    return over();
+                }
+                Ok(Output::Content(content))
+            }
+            _ => {
+                Err("the handler's output must have exactly one of text, cid or content_b64".into())
+            }
+        }
+    }
 }
 
 /// The client for handler requests: no proxy and no redirects, so a request
@@ -257,8 +349,9 @@ enum Exchange {
     Failed(String),
 }
 
-/// POST `request` as JSON to `url`, waiting at most `timeout`. Blocking.
-fn exchange(url: &str, request: &impl Serialize, timeout: Duration) -> Exchange {
+/// POST `request` as JSON to `url`, waiting at most `timeout` and reading at
+/// most `limit` bytes of the answer. Blocking.
+fn exchange(url: &str, request: &impl Serialize, timeout: Duration, limit: u64) -> Exchange {
     let Ok(body) = serde_json::to_vec(request) else {
         return Exchange::Unsendable("the request couldn't be encoded".into());
     };
@@ -275,7 +368,7 @@ fn exchange(url: &str, request: &impl Serialize, timeout: Duration) -> Exchange 
     let body = response
         .body_mut()
         .with_config()
-        .limit(MAX_ANSWER_BYTES)
+        .limit(limit)
         .read_to_string()
         .map_err(|e| e.to_string());
     Exchange::Answered { status, body }
@@ -298,7 +391,7 @@ fn reason(body: Result<String, String>, status: ureq::http::StatusCode) -> Strin
 
 /// Ask the handler at `url` to do a job, waiting at most `timeout`. Blocking.
 pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> Answer {
-    let (status, body) = match exchange(url, job, timeout) {
+    let (status, body) = match exchange(url, job, timeout, MAX_ANSWER_BYTES) {
         Exchange::Answered { status, body } => (status, body),
         Exchange::Unsendable(e) => return Answer::Declined(e),
         Exchange::Failed(e) => return Answer::Retry(e),
@@ -306,7 +399,10 @@ pub fn call_handler(url: &str, job: &HandlerRequest<'_>, timeout: Duration) -> A
     if status.is_success() {
         // An answer too big, or not text, would be the same next time.
         return match body.map(|b| serde_json::from_str::<Done>(&b)) {
-            Ok(Ok(done)) => Answer::Output(done.output),
+            Ok(Ok(done)) => done
+                .output
+                .output()
+                .map_or_else(Answer::Declined, Answer::Output),
             Ok(Err(e)) => Answer::Declined(format!("the handler's answer had no output: {e}")),
             Err(e) => Answer::Declined(format!("the handler's answer can't be read: {e}")),
         };
@@ -353,7 +449,7 @@ struct Price {
 
 /// Ask the quote handler at `url` to price a request, waiting at most `timeout`. Blocking.
 pub fn call_quote(url: &str, request: &QuoteRequest<'_>, timeout: Duration) -> Priced {
-    let (status, body) = match exchange(url, request, timeout) {
+    let (status, body) = match exchange(url, request, timeout, MAX_QUOTE_BYTES) {
         Exchange::Answered { status, body } => (status, body),
         Exchange::Unsendable(e) => return Priced::Declined(e),
         Exchange::Failed(e) => return Priced::Retry(e),

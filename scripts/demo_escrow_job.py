@@ -51,7 +51,7 @@ DOCUMENT = ("Logos is a privacy-first stack for decentralised apps. It combines 
             "private execution, peer-to-peer messaging, content-addressed storage and a mixnet.")
 
 
-def start(name, bin_, session, wallet_dir, bootstrap, preset, log_dir):
+def start(name, bin_, session, wallet_dir, bootstrap, preset, log_dir, files_root=None):
     env = dict(
         os.environ,
         LOGOSCTL_CONFIG_DIR=session,
@@ -62,6 +62,8 @@ def start(name, bin_, session, wallet_dir, bootstrap, preset, log_dir):
     )
     if POLL:
         env["LOGOS_AGENTS_FOLLOW_THROUGH_SECS"] = str(POLL)
+    if files_root:
+        env["LOGOS_MCP_FILES_ROOT"] = files_root
     c = Client([bin_], env, open(os.path.join(log_dir, f"{name}.log"), "w"))
     c.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                              "clientInfo": {"name": name, "version": "0"}})
