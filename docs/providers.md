@@ -49,7 +49,7 @@ Content-Type: application/json
 {"job": "<id>", "service_id": "acme/summarize/v1", "input": {"text": "..."}, "price_lepta": "1000000", "deadline_ms": 1794400000000}
 ```
 
-`input` is `{"text": ...}` or `{"cid": ...}`, as the buyer sent it. It's untrusted. The answer is the output in the same shape:
+`input` is `{"text": ...}` or `{"cid": ...}`, as the buyer sent it. It's untrusted. The request goes to the handler's URL itself: no proxy, and no redirects. The answer is the output in the same shape:
 
 ```http
 200 OK
@@ -63,7 +63,7 @@ Content-Type: application/json
 | `200` with an output | records the delivery |
 | `4xx` | declines the job with the response body as the reason. A buyer who paid into escrow gets a refund at once |
 | `5xx`, a timeout or no connection | tries again with backoff while there's time to deliver, then declines |
-| an output too big for a chat message | declines |
+| an output too big for a chat message, an answer that can't be read, or a redirect | declines |
 
 The same job can reach the handler twice, after a retry or a restart. `job` stays the same, so the handler can return its earlier output.
 
