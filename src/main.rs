@@ -56,7 +56,9 @@ async fn provide(file: PathBuf, args: Vec<OsString>) -> anyhow::Result<()> {
     advertising.abort();
     // Stop advertising, so buyers don't find an offer nobody serves.
     server.apply_offers(&[]).await;
-    Ok(())
+    // Now, not once a handler still at work answers: that can take hours. A
+    // restart asks it again, and the job id lets it answer as before.
+    std::process::exit(0)
 }
 
 /// Ctrl-C, or SIGTERM where there is one.
