@@ -4207,3 +4207,238 @@ async fn a_second_server_on_a_wallet_does_not_advertise() {
             .is_empty()
     );
 }
+
+/// A handler on this machine that answers each request with the next of
+/// `answers`, keeping the requests' bodies.
+fn handler(answers: Vec<(&'static str, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/run", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let kept = seen.clone();
+    std::thread::spawn(move || {
+        for (status, body) in answers {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if got.len() >= end + 4 + length {
+                        kept.lock().unwrap().push(text[end + 4..].to_string());
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = conn.write_all(reply.as_bytes());
+        }
+    });
+    (url, seen)
+}
+
+fn spec(handler: Option<&str>, max_jobs: u32) -> crate::provider::OfferSpec {
+    crate::provider::OfferSpec {
+        service_id: SVC.into(),
+        tag: "v1".into(),
+        price_lepta: "1000000".into(),
+        deliver_within_s: 600,
+        escrow_account: None,
+        handler: handler.map(str::to_string),
+        max_jobs,
+    }
+}
+
+/// Wait until `fake` has made `n` calls to `key`.
+async fn calls(fake: &Routed, key: &str, n: usize) -> Vec<Vec<String>> {
+    for _ in 0..200 {
+        let made = fake.calls_to(key);
+        if made.len() >= n {
+            return made;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "{key} was called {} times, not {n}",
+        fake.calls_to(key).len()
+    );
+}
+
+#[tokio::test]
+async fn an_offer_with_a_handler_quotes_requests_on_its_own() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&spec(Some("http://127.0.0.1:9/run"), 1))
+        .await
+        .unwrap();
+    assert_eq!(s.follow_through().await, [format!("service_quote {JOB}")]);
+    assert!(matches!(
+        sent(&fake.calls_to("chat_module.send_message")[0]).body,
+        Body::Quote { .. }
+    ));
+}
+
+#[tokio::test]
+async fn an_offer_without_a_handler_leaves_requests_to_the_agent() {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        history(&[(false, &request_text())]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&spec(None, 1)).await.unwrap();
+    assert!(s.follow_through().await.is_empty());
+    assert!(fake.calls_to("chat_module.send_message").is_empty());
+}
+
+#[tokio::test]
+async fn a_full_offer_declines_a_request_as_busy() {
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+    let mut second = protocol::Message::new(
+        OTHER,
+        Body::Request {
+            service: SVC.into(),
+            input: Payload::Text("another".into()),
+        },
+    );
+    second.id = format!("{:032x}", 9);
+    let second = protocol::encode(&second);
+    let fake = node();
+    // One job already quoted and not expired: the offer is full.
+    fake.set(
+        "chat_module.get_messages",
+        history(&[
+            (false, &request_text()),
+            (true, &quote_text("logos.dev", FAR)),
+            (false, &second),
+        ]),
+    );
+    let (s, _dir) = services_server(fake.clone());
+    s.offer_spec(&spec(Some("http://127.0.0.1:9/run"), 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.follow_through().await,
+        [format!("service_reject {OTHER}")]
+    );
+    let told = sent(&fake.calls_to("chat_module.send_message")[0]);
+    assert_eq!(told.job, OTHER);
+    assert!(
+        matches!(&told.body, Body::Reject { reason } if reason.contains("busy")),
+        "{told:?}"
+    );
+}
+
+/// A provider with a paid escrow job and an offer whose handler is `url`.
+async fn paid_job_for(url: &str, deadline: u64) -> (AgentServer, Arc<Routed>, tempfile::TempDir) {
+    let fake = node();
+    fake.set(
+        "chat_module.get_messages",
+        provider_escrow_history(deadline),
+    );
+    fake.set(
+        "lez_core.get_account_public",
+        job_record(PROVIDER_ACCOUNT, AGENT_FROM, 1_000_000, deadline, 0),
+    );
+    fake.set(
+        "lez_core.send_generic_public_transaction",
+        generic_ok("tx1"),
+    );
+    let (s, dir) = services_server(fake.clone());
+    s.offer_spec(&spec(Some(url), 1)).await.unwrap();
+    (s, fake, dir)
+}
+
+#[tokio::test]
+async fn a_paid_job_goes_to_the_handler_and_its_output_is_recorded() {
+    let (url, seen) = handler(vec![("200 OK", r#"{"output": {"text": "done"}}"#)]);
+    let (s, fake, dir) = paid_job_for(&url, FAR + 600_000).await;
+    s.follow_through().await;
+    let sends = calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    assert_eq!(instruction(&sends[0])[0], 1, "a Deliver");
+    let asked: Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+    assert_eq!(asked["job"], JOB);
+    assert_eq!(asked["input"], json!({ "text": "summarise this" }));
+    let kept = std::fs::read_to_string(dir.path().join("service-results.json")).unwrap();
+    assert!(kept.contains("\"done\""), "{kept}");
+}
+
+#[tokio::test]
+async fn a_handler_that_declines_returns_the_job_for_a_refund() {
+    let (url, _seen) = handler(vec![("422 Unprocessable Entity", "not a document")]);
+    let (s, fake, _dir) = paid_job_for(&url, FAR + 600_000).await;
+    s.follow_through().await;
+    let sends = calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    assert_eq!(instruction(&sends[0])[0], 5, "a Return");
+    let told = calls(&fake, "chat_module.send_message", 1).await;
+    assert!(
+        matches!(&sent(&told[0]).body, Body::Failed { reason } if reason.contains("not a document")),
+        "{:?}",
+        sent(&told[0])
+    );
+}
+
+#[tokio::test]
+async fn a_handler_that_fails_for_now_is_asked_again() {
+    let (url, seen) = handler(vec![
+        ("503 Service Unavailable", "busy"),
+        ("200 OK", r#"{"output": {"text": "done"}}"#),
+    ]);
+    let (s, fake, _dir) = paid_job_for(&url, FAR + 600_000).await;
+    s.follow_through().await;
+    let sends = calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    assert_eq!(instruction(&sends[0])[0], 1, "a Deliver");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_paid_job_too_late_to_deliver_is_returned_without_the_handler() {
+    let (url, seen) = handler(vec![("200 OK", r#"{"output": {"text": "done"}}"#)]);
+    let soon = now_ms() + 3 * 60_000;
+    let (s, fake, _dir) = paid_job_for(&url, soon).await;
+    s.follow_through().await;
+    let sends = calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    assert_eq!(instruction(&sends[0])[0], 5, "a Return");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_handler_runs_once_per_job_however_many_passes() {
+    let (url, seen) = handler(vec![("200 OK", r#"{"output": {"text": "done"}}"#)]);
+    let (s, fake, _dir) = paid_job_for(&url, FAR + 600_000).await;
+    s.follow_through().await;
+    s.follow_through().await;
+    calls(&fake, "lez_core.send_generic_public_transaction", 1).await;
+    s.follow_through().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        fake.calls_to("lez_core.send_generic_public_transaction")
+            .len(),
+        1
+    );
+}
