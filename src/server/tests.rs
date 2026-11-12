@@ -4443,3 +4443,27 @@ async fn a_handler_runs_once_per_job_however_many_passes() {
         1
     );
 }
+
+#[tokio::test]
+async fn applying_offers_stops_the_dropped_ones_and_advertises_the_rest() {
+    let fake = node();
+    let (s, _dir) = services_server(fake.clone());
+    let mut other = spec(None, 1);
+    other.service_id = "demo/translate/v1".into();
+    let first = s
+        .apply_offers(&[spec(Some("http://127.0.0.1:9/run"), 1), other])
+        .await;
+    assert!(first[SVC].get("error").is_none(), "{first}");
+    assert!(first["demo/translate/v1"].get("error").is_none(), "{first}");
+    let second = s
+        .apply_offers(&[spec(Some("http://127.0.0.1:9/run"), 2)])
+        .await;
+    assert_eq!(second["demo/translate/v1"]["stopped"], true, "{second}");
+    let stopped = fake.calls_to("libp2p_module.discoStopAdvertising");
+    assert!(
+        stopped
+            .iter()
+            .any(|c| c.iter().any(|a| a.contains("demo/translate/v1"))),
+        "{stopped:?}"
+    );
+}

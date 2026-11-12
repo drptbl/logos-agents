@@ -1531,6 +1531,37 @@ impl AgentServer {
         self.offer(p, auto).await
     }
 
+    /// Make this server's offers match `wanted`: stop the ones no longer
+    /// there and advertise the rest. Says what happened to each, by service id.
+    pub async fn apply_offers(&self, wanted: &[crate::provider::OfferSpec]) -> Value {
+        let current: Vec<String> = self.services.lock().await.offers.keys().cloned().collect();
+        let mut results = serde_json::Map::new();
+        for id in current
+            .into_iter()
+            .filter(|id| !wanted.iter().any(|w| w.service_id == *id))
+        {
+            let stopped = tool_json(
+                self.service_stop(Parameters(ServiceParams {
+                    service_id: id.clone(),
+                }))
+                .await,
+            );
+            let result = match stopped {
+                Ok(_) => json!({ "stopped": true }),
+                Err(e) => json!({ "error": e }),
+            };
+            results.insert(id, result);
+        }
+        for spec in wanted {
+            let result = match self.offer_spec(spec).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e }),
+            };
+            results.insert(spec.service_id.clone(), result);
+        }
+        Value::Object(results)
+    }
+
     async fn offer(&self, p: OfferParams, auto: Option<Auto>) -> Result<Value, String> {
         self.needs(&["chat", "discovery", "wallet"])?;
         // Another server running this wallet's services would get the requests.
