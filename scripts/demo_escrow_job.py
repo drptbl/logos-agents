@@ -84,8 +84,10 @@ def fleet_peers():
             ask = urllib.request.Request(FLEETS, headers={"User-Agent": "logos-agents-demo"})
             with urllib.request.urlopen(ask, timeout=20) as r:
                 nodes = json.load(r)["logos.dev"]["logos-node-delivery"].values()
-            peers = [n["ServiceMeta"]["libp2p_multiaddr"] + "/p2p/" + n["ServiceMeta"]["libp2p_peer_id"]
-                     for n in nodes if n["ServiceMeta"].get("libp2p_peer_id")]
+            # An entry missing either part is skipped, not the whole list.
+            peers = [m["libp2p_multiaddr"] + "/p2p/" + m["libp2p_peer_id"]
+                     for m in (n.get("ServiceMeta") or {} for n in nodes)
+                     if m.get("libp2p_multiaddr") and m.get("libp2p_peer_id")]
             if peers:
                 return ",".join(peers)
         except (OSError, ValueError, KeyError, TypeError) as e:
@@ -93,28 +95,40 @@ def fleet_peers():
         time.sleep(5)
     log("using scripts/logos-dev-peers.txt instead")
     with open(os.path.join(SCRIPTS, "logos-dev-peers.txt")) as f:
-        return ",".join(line.strip() for line in f if line.strip() and not line.startswith("#"))
+        lines = (line.strip() for line in f)
+        return ",".join(line for line in lines if line and not line.startswith("#"))
+
+
+def run(cmd):
+    """A command's stdout. On failure it exits with the command's stderr, which never holds
+    a secret: devnet_wallets.sh keeps the recovery phrase out of it."""
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode != 0:
+        sys.exit(f"{os.path.basename(cmd[0])} {' '.join(cmd[1:3])} failed: {done.stderr.strip()}")
+    return done.stdout
 
 
 def devnet(*args):
     """A logos-devnet command's JSON output."""
-    out = subprocess.run(["logos-devnet", "--json", *args], capture_output=True, text=True, check=True)
-    return json.loads(out.stdout)
+    return json.loads(run(["logos-devnet", "--json", *args]))
 
 
 def on_devnet(args):
     """Fills in sessions, wallets and the escrow id from the devnet that `logos-devnet up`
     started from logos-devnet.toml: both servers take its env, and each side gets a new
     wallet, funded from its faucet."""
-    os.environ.update(devnet("env"))
+    env = devnet("env")
+    # An id left in the shell, such as the testnet's, must not stand in for the devnet's.
+    if not env.get("LOGOS_PROGRAM_ESCROW"):
+        sys.exit("the devnet has no escrow deployed: run scripts/fetch_escrow.sh, then logos-devnet up")
+    os.environ.update(env)
     for side in ("provider", "buyer"):
         setattr(args, f"{side}_session", devnet("session", "env", f"agents-{side}")["LOGOSCTL_CONFIG_DIR"])
     wallets = tempfile.mkdtemp(prefix="logos-agents-devnet-wallets-")
-    made = subprocess.run([os.path.join(SCRIPTS, "devnet_wallets.sh"), wallets],
-                          capture_output=True, text=True, check=True)
+    made = run([os.path.join(SCRIPTS, "devnet_wallets.sh"), wallets])
     args.provider_wallet = os.path.join(wallets, "provider")
     args.buyer_wallet = os.path.join(wallets, "buyer")
-    args.buyer_from = made.stdout.strip()
+    args.buyer_from = made.strip()
     log(f"devnet wallets in {wallets}, buyer {args.buyer_from}")
 
 
@@ -186,6 +200,14 @@ def paid_job(provider, buyer, chat_address, args, text):
     return job
 
 
+def poll_secs(text):
+    """--poll's value: whole seconds the servers accept too."""
+    secs = int(text)
+    if not 1 <= secs <= 3600:
+        raise argparse.ArgumentTypeError("must be 1 to 3600 seconds")
+    return secs
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default="target/debug/logos-agents")
@@ -204,16 +226,18 @@ def main():
     ap.add_argument("--service", default=f"logos-mcp-demo/summarize/v{int(time.time())}")
     ap.add_argument("--decline", action="store_true", help="also run a job the provider declines")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds to wait for each escrow step")
-    ap.add_argument("--poll", type=int, help="seconds between checks, for the demo and both servers: "
+    ap.add_argument("--poll", type=poll_secs, help="seconds between checks, for the demo and both servers: "
                     "a few suit a local devnet, whose blocks land in a second")
     args = ap.parse_args()
     global POLL
     POLL = args.poll
+    sides = ("provider_session", "provider_wallet", "buyer_session", "buyer_wallet", "buyer_from")
     if args.devnet:
+        given = [f"--{a.replace('_', '-')}" for a in sides if getattr(args, a)]
+        if given:
+            ap.error(f"--devnet sets {', '.join(given)} itself")
         on_devnet(args)
-    missing = [f"--{a.replace('_', '-')}" for a in
-               ("provider_session", "provider_wallet", "buyer_session", "buyer_wallet", "buyer_from")
-               if not getattr(args, a)]
+    missing = [f"--{a.replace('_', '-')}" for a in sides if not getattr(args, a)]
     if missing:
         ap.error(f"{', '.join(missing)} needed, or --devnet")
     args.bootstrap = args.bootstrap or fleet_peers()
