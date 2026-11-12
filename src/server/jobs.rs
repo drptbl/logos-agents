@@ -51,6 +51,15 @@ struct Offer {
     /// The agent account escrow pays and that pays the escrow fees, when
     /// quotes offer escrow.
     escrow_account: Option<String>,
+    /// Set when the offer runs on its own: see `docs/providers.md`.
+    auto: Option<Auto>,
+}
+
+/// What runs an offer with no agent: its handler, and how many jobs it takes at once.
+#[derive(Debug, Clone)]
+struct Auto {
+    handler: String,
+    max_jobs: u32,
 }
 
 /// A payment sent, or maybe sent, before the provider was told about it.
@@ -276,6 +285,8 @@ pub(super) struct Services {
     /// A plain mutex, so a call's guard can free its job when the call is
     /// dropped midway, as a cancelled request is.
     pub(super) busy: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// Jobs whose handler is running, one task per job.
+    running: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Payments that went out, or may have, before the provider was told:
     /// job -> tx hash, `None` when the outcome is unknown. Never paid twice,
     /// so it is kept in `PAYMENTS` too and survives a restart.
@@ -1248,48 +1259,73 @@ impl AgentServer {
         &self,
         Parameters(p): Parameters<OfferParams>,
     ) -> Result<CallToolResult, McpError> {
+        match self.offer(p, None).await {
+            Ok(v) => ok(v),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// Advertise an offer from an offers file or the Basecamp app: one with a
+    /// handler runs on its own.
+    pub async fn offer_spec(&self, spec: &crate::provider::OfferSpec) -> Result<Value, String> {
+        let p = OfferParams {
+            service_id: spec.service_id.clone(),
+            tag: spec.tag.clone(),
+            price_lepta: spec.price_lepta.clone(),
+            deliver_within_s: Some(spec.deliver_within_s),
+            escrow: None,
+            escrow_account: spec.escrow_account.clone(),
+        };
+        let auto = spec.handler.clone().map(|handler| Auto {
+            handler,
+            max_jobs: spec.max_jobs,
+        });
+        self.offer(p, auto).await
+    }
+
+    async fn offer(&self, p: OfferParams, auto: Option<Auto>) -> Result<Value, String> {
         if let Err(e) = self.needs(&["chat", "discovery", "wallet"]) {
-            return fail(e);
+            return Err(String::from(e));
         }
         // Another server running this wallet's services would get the requests.
         if let Err(e) = self.hold_wallet().await {
-            return fail(e.to_string());
+            return Err(String::from(e.to_string()));
         }
         if let Err(e) = guard::validate_service_id(&p.service_id) {
-            return fail(e);
+            return Err(String::from(e));
         }
         if p.tag.len() > guard::MAX_AD_TAG_BYTES {
-            return fail(format!(
+            return Err(String::from(format!(
                 "tag is {} bytes; discovery allows at most {}",
                 p.tag.len(),
                 guard::MAX_AD_TAG_BYTES
-            ));
+            )));
         }
         if guard::amount_le16_hex(&p.price_lepta).is_err()
             || p.price_lepta.trim_start_matches('0').is_empty()
         {
-            return fail("price_lepta must be a whole number of lepta above zero, as digits");
+            return Err(String::from("price_lepta must be a whole number of lepta above zero, as digits"));
         }
         let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
         if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
-            return fail(format!(
+            return Err(String::from(format!(
                 "deliver_within_s must be between 1 and {MAX_DELIVER_S} seconds"
-            ));
+            )));
         }
         if let Err(e) = self.base.wallet() {
-            return fail(format!("services are paid into the agent wallet: {e}"));
+            return Err(String::from(format!("services are paid into the agent wallet: {e}")));
         }
         let escrow_account = if p.escrow == Some(false) {
             None
         } else {
             match self.escrow_account(p.escrow_account.as_deref()).await {
                 Ok(account) => Some(account),
-                Err(e) => return fail(e),
+                Err(e) => return Err(String::from(e)),
             }
         };
         let address = match self.base.ensure_chat().await {
             Ok((address, _)) => address,
-            Err(e) => return fail(e),
+            Err(e) => return Err(String::from(e)),
         };
         let _advertising = self.advertising.lock().await;
         let (replacing, others) = {
@@ -1302,7 +1338,7 @@ impl AgentServer {
             .await
         {
             Ok(id) => id,
-            Err(e) => return fail(e),
+            Err(e) => return Err(String::from(e)),
         };
         {
             let mut state = self.services.lock().await;
@@ -1315,6 +1351,7 @@ impl AgentServer {
                     deliver_within_s,
                     advertised_to: address.clone(),
                     escrow_account: escrow_account.clone(),
+                    auto,
                 },
             );
         }
@@ -1323,7 +1360,7 @@ impl AgentServer {
         let warning = others.then_some(
             "this node already advertised another service, and libp2p_module 1.1.0 only lets a node be found for the first service it advertises: buyers may not find this one until the libp2p module restarts",
         );
-        ok(json!({
+        Ok(json!({
             "warning": warning,
             "service_id": p.service_id,
             "tag": p.tag,
