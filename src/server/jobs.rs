@@ -15,6 +15,16 @@ use crate::protocol::{self, Body, Job, Payload, Role, State};
 /// so a payment the user approves late still lands within it.
 const QUOTE_VALID_MS: u64 = 30 * 60 * 1000;
 const DELIVER_WITHIN_S: u64 = 10 * 60;
+/// How long a handler that failed for now is left before it's asked again,
+/// doubling up to `RETRY_MAX`.
+const RETRY_FIRST: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// The reason a full offer gives the buyer.
+const BUSY: &str = "busy: this offer takes no more jobs right now, try again later";
 /// Room kept in a chat message for the protocol fields around a text input or output.
 const ENVELOPE_BYTES: usize = 1024;
 /// Kept between an escrow deadline and the calls that race it: the chain
@@ -1071,10 +1081,27 @@ impl AgentServer {
             *seen.entry(f.job.job.clone()).or_default() += 1;
         }
         let notes = self.with_payments().await.submitted.clone();
-        let (pending, settled) = {
+        let (pending, settled, offers) = {
             let state = self.services.lock().await;
-            (state.pending.clone(), state.settled.clone())
+            (
+                state.pending.clone(),
+                state.settled.clone(),
+                state.offers.clone(),
+            )
         };
+        // What each offer has taken: quotes still open, and paid jobs not yet delivered.
+        let now = now_ms();
+        let mut taken = BTreeMap::<String, u32>::new();
+        for f in &jobs {
+            let open = match f.job.state {
+                State::Quoted => f.job.quote.as_ref().is_some_and(|q| q.expires_at > now),
+                State::Paid => true,
+                _ => false,
+            };
+            if f.job.role == Role::Provider && open {
+                *taken.entry(f.job.service.clone()).or_default() += 1;
+            }
+        }
         for found in jobs {
             // The user can switch the tools off while a pass runs.
             if !self.follows_through() {
@@ -1084,9 +1111,22 @@ impl AgentServer {
             if seen[&id] > 1 || settled.contains(&id) {
                 continue;
             }
-            let step = self
-                .follow_through_job(&found, notes.get(&id), pending.contains_key(&id))
-                .await;
+            // An offer that runs on its own quotes requests and works paid jobs itself.
+            let auto = offers
+                .get(&found.job.service)
+                .and_then(|o| o.auto.clone())
+                .filter(|_| found.job.role == Role::Provider);
+            let provided = match &auto {
+                Some(auto) => self.provide(&found, auto, &mut taken).await,
+                None => Ok(None),
+            };
+            let step = match provided {
+                Ok(None) => {
+                    self.follow_through_job(&found, notes.get(&id), pending.contains_key(&id))
+                        .await
+                }
+                other => other,
+            };
             match step {
                 Ok(Some((tool, v))) => {
                     tracing::info!(job = %id, "follow-through: {tool}");
@@ -1103,6 +1143,214 @@ impl AgentServer {
             }
         }
         done
+    }
+
+    /// The provider's step for a job on an offer that runs on its own: quote a
+    /// request it has room for, decline one it hasn't, and start the handler
+    /// for a paid job.
+    async fn provide(
+        &self,
+        found: &Found,
+        auto: &Auto,
+        taken: &mut BTreeMap<String, u32>,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let Found { can_send, job, .. } = found;
+        if !*can_send {
+            return Ok(None);
+        }
+        match job.state {
+            State::Requested => {
+                let held = taken.entry(job.service.clone()).or_default();
+                if *held >= auto.max_jobs {
+                    let v = self.reject_job(&job.job, BUSY).await?;
+                    return Ok(Some(("service_reject", v)));
+                }
+                let v = tool_json(
+                    self.service_quote(Parameters(JobParams {
+                        job: job.job.clone(),
+                    }))
+                    .await,
+                )?;
+                *held += 1;
+                Ok(Some(("service_quote", v)))
+            }
+            State::Paid => self.start_handler(job, auto).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// Start the handler for a job paid on its quote's terms, unless one runs
+    /// for it already or a delivery may still land. Too late to deliver, the
+    /// job is declined instead, so the buyer gets the money back.
+    async fn start_handler(
+        &self,
+        job: &Job,
+        auto: &Auto,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        let set = self.services.lock().await.running.clone();
+        let Some(running) = Busy::claim(set, &job.job) else {
+            return Ok(None);
+        };
+        let q = job.quote.as_ref().ok_or("the job has no quote")?;
+        let deadline = q
+            .expires_at
+            .saturating_add(q.deliver_within_s.saturating_mul(1000));
+        match job.escrow_buyer.as_deref() {
+            Some(buyer) => {
+                let Some(e) = escrow_job(job, buyer)? else {
+                    return Ok(None);
+                };
+                match self.escrow_record(&e).await? {
+                    Some(r) if e.holds(&r) && r.state == JobState::Open => {}
+                    _ => return Ok(None),
+                }
+                if self.in_flight_recent(&job.job).await {
+                    return Ok(None);
+                }
+            }
+            None => {
+                if !self.paid_on_chain(job).await {
+                    return Ok(None);
+                }
+            }
+        }
+        if too_late_for(deadline) {
+            drop(running);
+            let v = self
+                .reject_job(&job.job, "too late to deliver before the deadline")
+                .await?;
+            return Ok(Some(("service_reject", v)));
+        }
+        let kept = self.saved_result(&job.job).await?;
+        let server = self.clone();
+        let (job, auto) = (job.clone(), auto.clone());
+        tokio::spawn(async move {
+            let _running = running;
+            server.run_handler(job, auto, deadline, kept).await;
+        });
+        Ok(None)
+    }
+
+    /// Ask the handler for a job's output, again while it fails for now and
+    /// there's time, then deliver it or decline the job. An output kept from
+    /// before is delivered without asking again.
+    async fn run_handler(&self, job: Job, auto: Auto, deadline: u64, kept: Option<Payload>) {
+        use crate::provider::{Answer, HandlerRequest, call_handler};
+        let mut wait = RETRY_FIRST;
+        let answer = loop {
+            if let Some(output) = &kept {
+                break Answer::Output(output.clone());
+            }
+            let left = deadline
+                .saturating_sub(DEADLINE_MARGIN_MS)
+                .saturating_sub(now_ms());
+            if left < 1000 {
+                break Answer::Declined("the handler didn't finish in time".into());
+            }
+            let (url, id, service, input, price) = (
+                auto.handler.clone(),
+                job.job.clone(),
+                job.service.clone(),
+                job.input.clone(),
+                job.quote
+                    .as_ref()
+                    .map(|q| q.price_lepta.clone())
+                    .unwrap_or_default(),
+            );
+            let answer = tokio::task::spawn_blocking(move || {
+                let asked = HandlerRequest {
+                    job: &id,
+                    service_id: &service,
+                    input: &input,
+                    price_lepta: &price,
+                    deadline_ms: deadline,
+                };
+                call_handler(&url, &asked, std::time::Duration::from_millis(left))
+            })
+            .await
+            .unwrap_or_else(|e| Answer::Retry(e.to_string()));
+            match answer {
+                Answer::Retry(e) => {
+                    tracing::warn!(job = %job.job, "handler failed for now: {e}");
+                    let left = deadline
+                        .saturating_sub(DEADLINE_MARGIN_MS)
+                        .saturating_sub(now_ms());
+                    if u128::from(left) < wait.as_millis() + 1000 {
+                        break Answer::Declined("the handler didn't finish in time".into());
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RETRY_MAX);
+                }
+                other => break other,
+            }
+        };
+        let (tool, result) = match answer {
+            Answer::Output(output) => {
+                let (output_text, output_cid) = match output {
+                    Payload::Text(t) => (Some(t), None),
+                    Payload::Cid(c) => (None, Some(c)),
+                };
+                // An output that can't go out is the handler's: decline, so the
+                // buyer gets the money back.
+                match payload(output_text.clone(), output_cid.clone(), "output") {
+                    Ok(_) => {
+                        let p = DeliverParams {
+                            job: job.job.clone(),
+                            output_text,
+                            output_cid,
+                        };
+                        (
+                            "service_deliver",
+                            self.one_at_a_time(&job.job, self.deliver(p)).await,
+                        )
+                    }
+                    Err(e) => (
+                        "service_reject",
+                        self.reject_job(
+                            &job.job,
+                            &format!("the handler's output can't be delivered: {e}"),
+                        )
+                        .await,
+                    ),
+                }
+            }
+            Answer::Declined(reason) => {
+                ("service_reject", self.reject_job(&job.job, &reason).await)
+            }
+            Answer::Retry(_) => unreachable!("retries loop until an answer or a decline"),
+        };
+        match &result {
+            Ok(v) => {
+                tracing::info!(job = %job.job, "provider: {tool}");
+                self.base.record_activity(
+                    &format!("auto:{tool}"),
+                    &json!({ "job": job.job }),
+                    true,
+                    &v.to_string(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(job = %job.job, "provider: {tool} failed: {e}");
+                self.base.record_activity(
+                    &format!("auto:{tool}"),
+                    &json!({ "job": job.job }),
+                    false,
+                    e,
+                );
+            }
+        }
+    }
+
+    /// Decline a job, giving `reason`: before payment the buyer is told, and
+    /// after it the escrow is returned so they can take their money back.
+    async fn reject_job(&self, job: &str, reason: &str) -> Result<Value, String> {
+        tool_json(
+            self.service_reject(Parameters(RejectParams {
+                job: job.to_string(),
+                reason: reason.to_string(),
+            }))
+            .await,
+        )
     }
 
     /// Whether the switches let the follow-through act.
@@ -1304,7 +1552,9 @@ impl AgentServer {
         if guard::amount_le16_hex(&p.price_lepta).is_err()
             || p.price_lepta.trim_start_matches('0').is_empty()
         {
-            return Err(String::from("price_lepta must be a whole number of lepta above zero, as digits"));
+            return Err(String::from(
+                "price_lepta must be a whole number of lepta above zero, as digits",
+            ));
         }
         let deliver_within_s = p.deliver_within_s.unwrap_or(DELIVER_WITHIN_S);
         if deliver_within_s == 0 || deliver_within_s > MAX_DELIVER_S {
@@ -1313,7 +1563,9 @@ impl AgentServer {
             )));
         }
         if let Err(e) = self.base.wallet() {
-            return Err(String::from(format!("services are paid into the agent wallet: {e}")));
+            return Err(String::from(format!(
+                "services are paid into the agent wallet: {e}"
+            )));
         }
         let escrow_account = if p.escrow == Some(false) {
             None
