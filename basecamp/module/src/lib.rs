@@ -42,6 +42,9 @@ const WATCHED: &[(&str, &[&str])] = &[
             "storageDownloadDone",
         ],
     ),
+    // Each new finalized tip, for chain_events. Subscribed again until the
+    // Blockchain app has loaded it.
+    ("blockchain_module", &["libBlock"]),
 ];
 
 /// The endpoint's port on first start: the next one after logos-mcp's, so both
