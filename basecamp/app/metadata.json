@@ -1,7 +1,7 @@
 {
   "name": "logos_agents_app",
   "display_name": "Agent Services",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "ui_qml",
   "interface": "universal",
   "category": "general",
