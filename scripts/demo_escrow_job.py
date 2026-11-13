@@ -24,9 +24,9 @@ server only uses a wallet it opened itself, so if another logos-mcp server
 used a session since lez_core loaded, reload lez_core there too.
 
 With --devnet, it runs on the local devnet that `logos-devnet up` starts from
-logos-devnet.toml instead: each side uses its session and the session's funded
-wallet, the escrow id comes from the devnet, and only logos-devnet and logosctl
-need to be on PATH.
+logos-devnet.toml instead: each side uses its session, restarted first, and the
+session's funded wallet, the escrow id comes from the devnet, and only
+logos-devnet (0.8.0 or later) and logosctl need to be on PATH.
 
 Exits non-zero if a job does not complete.
 """
@@ -137,9 +137,8 @@ def on_devnet(args):
         session = devnet("session", "env", f"agents-{side}")
         setattr(args, f"{side}_session", session["LOGOSCTL_CONFIG_DIR"])
         # libp2p_module 1.1.0 lets a node be found only for the first service it
-        # advertises: start each run with it fresh.
-        run(["logosctl", "module", "reload", "libp2p_module"],
-            env=dict(os.environ, LOGOSCTL_CONFIG_DIR=session["LOGOSCTL_CONFIG_DIR"]))
+        # advertises: start each run with a fresh daemon, its wallet and modules kept.
+        run(["logos-devnet", "session", "restart", f"agents-{side}"])
         # wallet_config.json and storage.json, side by side.
         setattr(args, f"{side}_wallet", os.path.dirname(session["LOGOS_DEVNET_WALLET_CONFIG"]))
         if side == "buyer":
