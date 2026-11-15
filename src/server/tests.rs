@@ -30,6 +30,18 @@ const AGENT_ACCOUNTS: &str = r#"[{"account_id":"e9ce8b81376428e3fb1a8192026027ac
 
 const AGENT_FROM: &str = "Public/GjgfTEYoYVFjomLH7zRzFHHGpLNEwD4iGtf53JhwSdMY";
 
+/// The agent wallet's accounts once a quote has made `NEW_ID` in it, as
+/// lez_core lists them: the account it had, then the new one.
+fn accounts_with_new() -> RawOutput {
+    lez(
+        "list_accounts",
+        &format!(
+            r#"[{},{{"account_id":"{NEW_ID}","is_public":true}}]"#,
+            AGENT_ACCOUNTS.trim_start_matches('[').trim_end_matches(']')
+        ),
+    )
+}
+
 const CHAT_LOADED: &str = r#"[{"name":"chat_module","status":"loaded"}]"#;
 
 const CHAT_ONLINE: &str =
@@ -558,15 +570,12 @@ async fn quoting_creates_a_fresh_account_for_the_job() {
     // The account is kept as a job account, which wallet_accounts groups.
     let saved = std::fs::read_to_string(dir.path().join("job-accounts.json")).unwrap();
     assert!(saved.contains(NEW_ID) && saved.contains(JOB), "{saved}");
-    fake.reset(
-        "lez_core.list_accounts",
-        lez(
-            "list_accounts",
-            &format!(r#"[{{"account_id":"{NEW_ID}","is_public":true}}]"#),
-        ),
-    );
+    fake.reset("lez_core.list_accounts", accounts_with_new());
     let accounts = body(&s.base.wallet_accounts().await.unwrap());
-    let account = &accounts["accounts"][0];
+    let account = accounts["accounts"]
+        .as_array()
+        .and_then(|all| all.iter().find(|a| a["job"].is_object()))
+        .unwrap_or_else(|| panic!("no job account: {accounts}"));
     assert_eq!(account["job"]["job"], JOB, "{accounts}");
     assert_eq!(account["job"]["service"], SVC);
 }
@@ -3109,6 +3118,7 @@ async fn a_job_accounts_file_that_cant_be_read_is_never_overwritten() {
     let r = s.service_quote(job(JOB)).await.unwrap();
     assert!(!is_error(&r), "{}", text(&r));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "{");
+    fake.reset("lez_core.list_accounts", accounts_with_new());
     let accounts = body(&s.base.wallet_accounts().await.unwrap());
     assert!(
         accounts["note"]
