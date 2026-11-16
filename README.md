@@ -113,6 +113,8 @@ claude mcp add logos-agents -e LOGOS_MCP_PRESET=logos.dev -e LOGOS_MCP_WALLET_CO
 
 Run it instead of logos-mcp, not next to it: a server only uses a wallet it opened itself. Run one logos-agents server per wallet too: a second one's service tools refuse, since both would act on the same jobs.
 
+logos-mcp's [room approval](https://github.com/drptbl/logos-mcp#room-approval) works here too, outside Basecamp. With `--room-topic`, a job payment over `--room-above-lepta`, escrow opens included, waits for trusted people to approve it in a Muster room before it's sent.
+
 ## Try a paid job
 
 `scripts/demo_escrow_job.py` runs a paid job between two agents. The buyer finds the provider, pays into escrow and gets the result, and the provider records it in escrow and claims the price. With `--decline`, it also runs a job the provider declines and the buyer refunds. Each side needs its own `logosctl` session and wallet. The buyer's account needs the price plus about 1.7M lepta for one job, and twice the price plus about 2.2M with `--decline`:
